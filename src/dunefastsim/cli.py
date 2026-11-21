@@ -31,6 +31,19 @@ def _steps_convert(args) -> int:
     return _steps_check(argparse.Namespace(path=args.out))
 
 
+def _steps_validate(args) -> int:
+    import yaml
+
+    from dunefastsim.steps import validate
+
+    out = {"energy": validate.energy(args.path, args.max_events)}
+    for cfg in args.config:
+        with open(cfg) as f:
+            out[f"containment {cfg}"] = validate.containment(args.path, yaml.safe_load(f), args.max_events)
+    print(json.dumps(out, indent=2))
+    return 0
+
+
 def _ndlar_config(args) -> int:
     import yaml
 
@@ -59,6 +72,11 @@ def main(argv=None) -> int:
     v.add_argument("--offset-m", default="", help="x,y,z of the detector-frame origin in the world frame (m)")
     v.add_argument("--max-events", type=int, default=None)
     v.set_defaults(fn=_steps_convert)
+    w = sub.add_parser("steps-validate", help="energy sums and containment in JAXTPC configs' drift volumes")
+    w.add_argument("path")
+    w.add_argument("--config", action="append", default=[], help="JAXTPC detector config YAML (repeatable)")
+    w.add_argument("--max-events", type=int, default=None)
+    w.set_defaults(fn=_steps_validate)
     g = sub.add_parser("ndlar-config", help="JAXTPC ND-LAr config with volumes from a GDML (needs [ldm])")
     g.add_argument("gdml")
     g.add_argument("--template", required=True, help="JAXTPC's config/dune_ndlar_config.yaml")

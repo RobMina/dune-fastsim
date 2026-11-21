@@ -114,6 +114,9 @@ def convert(root_path: str | Path, out_path: str | Path, detector: str = DEFAULT
     """Convert an edep-sim ROOT file to a step record (PyROOT; untested until phase 2)."""
     import ROOT  # noqa: N811 - available only where ROOT is
 
+    ROOT.gROOT.SetBatch(True)
+    if ROOT.gSystem.Load("libedepsim_io") < 0:
+        raise RuntimeError("cannot load libedepsim_io (edep-sim's I/O library) into ROOT")
     f = ROOT.TFile.Open(str(root_path))
     tree = f.Get("EDepSimEvents")
     if not tree:

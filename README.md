@@ -1,9 +1,11 @@
 # dune-fastsim
 
-JAX fast simulation of the DUNE Near Detector's liquid-argon TPC (ND-LAr) for light-dark-matter studies: charge
-readout through [JAXTPC](https://github.com/DeepLearnPhysics/JAXTPC), light through
-[lumen](https://github.com/OmarAlterkait/lumen) and [lumen-tpc](https://github.com/OmarAlterkait/lumen-tpc), fed by
-edep-sim energy deposits from [bdnmc-dune](https://github.com/RobMina/bdnmc-dune) or any other edep-sim job.
+A fully differentiable, fully on-device JAX simulation of the DUNE Near Detector's liquid-argon TPC (ND-LAr) for
+light-dark-matter studies: dark-matter scatters from BdNMC's JAX port (via
+[bdnmc-dune](https://github.com/RobMina/bdnmc-dune)), electron and photon transport in liquid argon on the device
+(to be written), charge readout through [JAXTPC](https://github.com/DeepLearnPhysics/JAXTPC) and light through
+[lumen](https://github.com/OmarAlterkait/lumen) and [lumen-tpc](https://github.com/OmarAlterkait/lumen-tpc). Geant4 is
+not part of the chain: edep-sim output is used only as an offline validation reference.
 
 This package **depends on** those projects and vendors none of them. What it adds is the glue between them:
 
@@ -17,18 +19,31 @@ This package **depends on** those projects and vendors none of them. What it add
 Public material only: no collaboration-internal geometry, configuration or results. Site paths come from
 `site.env` (see `site.env.example`), never from the code.
 
-## Status (v0.0.1, scaffold)
+## Status (v0.0.2)
 
 | Piece | State |
 |---|---|
 | `dtype` / `profile` / `site` | done; `DUNE_DEVICE_FLOAT` = `float32` or `float64` (default), other values fail |
 | `steps` schema, writer, checker | done; JAXTPC's own loader reads the files (test, with `JAXTPC_ROOT`) |
-| `steps.edepsim.convert` (edep-sim ROOT, PyROOT) | written, **not run yet**: needs ROOT + edep-sim I/O (the bdnmc-dune image) |
-| `geometry` JAXTPC volumes from the GDML | done on synthetic boxes; reproduces JAXTPC's drift directions; GDML path needs `[ldm]` |
+| `steps.edepsim.convert` (edep-sim ROOT, PyROOT) | validation only (Geant4 reference); run on a 2000-event edep-sim sample: summed deposits match edep-sim's own check exactly |
+| `steps.validate`, `dunefastsim steps-validate` | energy sums and containment of steps in a JAXTPC config's drift volumes |
+| `transport.parametric` (option A) | GFLASH parametric showers in liquid argon plus a leading track, a fluctuation ramp, a dE/dx spread and a photon conversion delay; differentiable, f32/f64; compared with Geant4 (below) |
+| `transport.compare` | option A against a Geant4 reference in the step format: deposited fraction, longitudinal and radial profiles, dE/dx, per energy bin |
+| option B (condensed-history electron/photon Monte Carlo in JAX) | planned |
+| `geometry` JAXTPC volumes from the GDML | done; on DUNE's hall GDML v2026.03.06 every Geant4 step in the active argon lands in exactly one generated drift volume |
 | `charge` (JAXTPC) | status check only; no simulation run yet |
 | `light` (lumen 0.2 + lumen-tpc `dune_ndlar`) | status check only |
 | `ldm` (bdnmc-dune) | status check only |
 | `container/dune-fastsim-jax.def` | stub, not built |
+
+### Option A against Geant4
+
+Same 2000 dark-matter-scattered electrons (34 MeV to 22 GeV) in ND-LAr, same drift volumes, Geant4 (edep-sim) vs
+option A: deposited fraction 0.740 vs 0.745 overall and within 0.02 in every energy bin; energy-weighted mean depth
+within 0.26 X0 in every bin. Remaining: below 300 MeV the radial profile is too peaked on the axis (no multiple
+scattering on the straight leading track), and radial containment is 1-4 % low at all energies. Two constants (the
+dE/dx spread and the photon-delay energy scale) were fitted to the same sample: an independent check is pending.
+About 4 ms per shower in float32 on 4 CPU cores.
 
 ### Known issue: two ND-LAr layouts
 
@@ -81,7 +96,8 @@ The offset is the centre of ND-LAr's active argon in that GDML's world frame (bd
 ```text
 src/dunefastsim/
   dtype.py profile.py site.py   device float mode, experiment profile, site.env loader
-  steps/      schema.py write.py edepsim.py
+  steps/      schema.py write.py edepsim.py validate.py
+  transport/  parametric.py (option A) compare.py
   geometry/   ndlar.py
   charge/     JAXTPC adapter      light/  lumen adapter      ldm/  bdnmc-dune adapter
   cli.py
