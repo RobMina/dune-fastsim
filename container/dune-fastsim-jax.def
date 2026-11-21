@@ -1,0 +1,16 @@
+# STUB, not built. JAX host image for dune-fastsim: AL9 + Python 3.11 + jax[cuda12]==0.6.2 + lumen 0.2 (lumen-tpc)
+# + JAXTPC at its pin (editable, from a checkout bound or cloned at build). JAXTPC has no licence yet: keep images
+# that contain it on our own sites, do not publish them. edep-sim stays in the bdnmc-dune image (two-image jobs).
+Bootstrap: docker
+From: almalinux:9
+
+%post
+    dnf -y install python3.11 python3.11-pip git gcc-c++ libgomp && dnf clean all
+    python3.11 -m pip install --no-cache-dir -U pip
+    # python3.11 -m pip install "jax[cuda12]==0.6.2" "lumen-tpc @ git+https://github.com/OmarAlterkait/lumen-tpc.git@66032a0a71b4369f07661427f8d2fc4d2d81267d"
+    # git clone https://github.com/DeepLearnPhysics/JAXTPC.git /opt/JAXTPC && git -C /opt/JAXTPC checkout 50ed555ec69adf1c5a7fdf67af81c544a751dd2e
+    # python3.11 -m pip install -e /opt/JAXTPC
+    # python3.11 -m pip install /opt/dune-fastsim
+
+%environment
+    export JAXTPC_ROOT=/opt/JAXTPC

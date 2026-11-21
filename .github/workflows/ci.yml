@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    name: pytest (synthetic)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -U pip && pip install -e '.[test,jax]'
+      - run: python -m pytest -q
+
+  pytest-jaxtpc:
+    name: pytest (+ JAXTPC loader and config checks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: JAXTPC at its pin (checkout only, not redistributed)
+        run: |
+          git clone -q https://github.com/DeepLearnPhysics/JAXTPC.git "$RUNNER_TEMP/JAXTPC"
+          git -C "$RUNNER_TEMP/JAXTPC" checkout -q 50ed555ec69adf1c5a7fdf67af81c544a751dd2e
+          echo "JAXTPC_ROOT=$RUNNER_TEMP/JAXTPC" >> "$GITHUB_ENV"
+      - run: python -m pip install -U pip && pip install -e '.[test,jax]'
+      - run: python -m pytest -q -rs

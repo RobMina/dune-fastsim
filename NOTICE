@@ -1,0 +1,15 @@
+dune-fastsim
+Copyright 2026 Rob Mina and contributors
+
+Licensed under the Apache License, Version 2.0 (LICENSE).
+
+This package depends on, and does not vendor or redistribute:
+
+- JAXTPC (https://github.com/DeepLearnPhysics/JAXTPC): no licence file at the pinned commit; used only from a
+  checkout the user installs. dunefastsim.steps.schema describes JAXTPC's input file layout; no JAXTPC code is copied.
+- lumen and lumen-tpc (https://github.com/OmarAlterkait/lumen, .../lumen-tpc), Apache-2.0.
+- bdnmc-dune (https://github.com/RobMina/bdnmc-dune), MIT.
+- edep-sim (https://github.com/lbl-neutrino/edep-sim): its ROOT output is read; no code is copied.
+
+DUNE geometry files (GDML) are not part of this repository; they are fetched from DUNE's public ND_Production
+repository at a fixed commit.
