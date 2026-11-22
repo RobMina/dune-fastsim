@@ -19,7 +19,7 @@ This package **depends on** those projects and vendors none of them. What it add
 Public material only: no collaboration-internal geometry, configuration or results. Site paths come from
 `site.env` (see `site.env.example`), never from the code.
 
-## Status (v0.0.2)
+## Status (v0.0.3)
 
 | Piece | State |
 |---|---|
@@ -29,7 +29,7 @@ Public material only: no collaboration-internal geometry, configuration or resul
 | `steps.validate`, `dunefastsim steps-validate` | energy sums and containment of steps in a JAXTPC config's drift volumes |
 | `transport.parametric` (option A) | GFLASH parametric showers in liquid argon plus a leading track, a fluctuation ramp, a dE/dx spread and a photon conversion delay; differentiable, f32/f64; compared with Geant4 (below) |
 | `transport.compare` | option A against a Geant4 reference in the step format: deposited fraction, longitudinal and radial profiles, dE/dx, per energy bin |
-| option B (condensed-history electron/photon Monte Carlo in JAX) | planned |
+| `transport.emphysics` + `transport.cascade` (option B) | condensed-history electron/photon cascade in JAX: e± physics from [hep-simkernels](https://github.com/RobMina/hep-simkernels) up to 1 GeV (Moller/Bhabha, Seltzer-Berger, Mott-corrected transport cross section, Urban fluctuations), Tsai bremsstrahlung above, Klein-Nishina Compton, Bethe-Heitler pair; Wentzel multiple scattering with lateral displacement, modified-Tsai emission angles; fixed-capacity particle and deposit buffers with overflow accounting; energy conserved per shower; extra `[transport]` |
 | `geometry` JAXTPC volumes from the GDML | done; on DUNE's hall GDML v2026.03.06 every Geant4 step in the active argon lands in exactly one generated drift volume |
 | `charge` (JAXTPC) | status check only; no simulation run yet |
 | `light` (lumen 0.2 + lumen-tpc `dune_ndlar`) | status check only |
@@ -44,6 +44,13 @@ within 0.26 X0 in every bin. Remaining: below 300 MeV the radial profile is too 
 scattering on the straight leading track), and radial containment is 1-4 % low at all energies. Two constants (the
 dE/dx spread and the photon-delay energy scale) were fitted to the same sample: an independent check is pending.
 About 4 ms per shower in float32 on 4 CPU cores.
+
+### Option B against Geant4 (first comparison)
+
+On subsets of the same two Geant4 samples (200 and 100 electrons): deposited fraction and mean depth agree within the
+subsets' statistics; within one Moliere radius 0.873 / 0.871 against Geant4's 0.857 / 0.864; the energy-weighted
+dE/dx spread is wider than Geant4's step-level spread (step-length dependent, under study). About 3-5 s per shower on
+4 CPU cores; GPU batching is next.
 
 ### Known issue: two ND-LAr layouts
 
@@ -97,7 +104,7 @@ The offset is the centre of ND-LAr's active argon in that GDML's world frame (bd
 src/dunefastsim/
   dtype.py profile.py site.py   device float mode, experiment profile, site.env loader
   steps/      schema.py write.py edepsim.py validate.py
-  transport/  parametric.py (option A) compare.py
+  transport/  parametric.py (option A) emphysics.py cascade.py (option B) compare.py
   geometry/   ndlar.py
   charge/     JAXTPC adapter      light/  lumen adapter      ldm/  bdnmc-dune adapter
   cli.py

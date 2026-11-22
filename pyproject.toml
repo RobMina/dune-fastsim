@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dunefastsim"
-version = "0.0.2"
+version = "0.0.3"
 description = "JAX fast simulation of the DUNE Near Detector (ND-LAr charge and light) for light-dark-matter studies"
 license = "Apache-2.0"
 requires-python = ">=3.11,<3.14"  # lumen 0.2 and jax 0.6.2: Python <=3.13
@@ -17,6 +17,10 @@ jax = ["jax==0.6.2"]
 light = ["lumen-tpc @ git+https://github.com/OmarAlterkait/lumen-tpc.git@66032a0a71b4369f07661427f8d2fc4d2d81267d"]
 # LDM events and the edep-sim job: bdnmc-dune (also gives the GDML reader used by dunefastsim.geometry).
 ldm = ["bdnmc-dune @ git+https://github.com/RobMina/bdnmc-dune.git@165be9ebd7cd8a6dbb1038e7ed3c62ea36235955"]
+# Option B transport: hep-simkernels (Geant4-matched e+- kernels; needs hep-simlib installed first, same pins as
+# mu2e-fastsim's core).
+transport = ["hep-simlib @ git+https://github.com/RobMina/hep-simlib.git@b5868350f789f49dfc174110e72d55a40758de67",
+             "hep-simkernels @ git+https://github.com/RobMina/hep-simkernels.git@2c3f0d4e74d31e79f72e37a346d561b306443db5"]
 test = ["pytest"]
 # Charge (JAXTPC) is NOT an extra: it has no licence yet and only supports an editable install from a checkout.
 # Clone it at dunefastsim.charge.JAXTPC_PIN, `pip install -e` it, and set JAXTPC_ROOT (see README).

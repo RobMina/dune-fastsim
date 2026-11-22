@@ -107,8 +107,8 @@ def _bin_report(rows, ke):
 
 
 def run(ref_path: str, config: dict, n_pairs: int = 2048, batch: int = 100, seed: int = 0, dtype: str = "float64",
-        max_events: int | None = None) -> dict:
-    """Compare option A with the reference; return a JSON-able report."""
+        max_events: int | None = None, model: str = "A", b_config=None, b_tables=None) -> dict:
+    """Compare option A (``model="A"``) or option B (``"B"``) with the reference; return a JSON-able report."""
     import jax
     import jax.numpy as jnp
 
@@ -135,10 +135,35 @@ def run(ref_path: str, config: dict, n_pairs: int = 2048, batch: int = 100, seed
                 dedx.append(10.0 * s["de"][ok] / s["dx"][ok])  # MeV/cm
     dedx = np.concatenate(dedx) if dedx else np.zeros(0)
 
-    f = jax.jit(lambda k, e, v, d: pm.showers(k, e, v, d, n_pairs=n_pairs, dtype=jdt))
     key = jax.random.PRNGKey(seed)
     a_rows, t_compile, t_run = [], None, 0.0
-    for b, s in enumerate(range(0, n, batch)):
+    b_stats = {"lost_mev": 0.0, "peak_max": 0, "iters_max": 0, "deposits_max": 0}
+    if model == "B":
+        from dunefastsim.transport import cascade as cs
+        from dunefastsim.transport import emphysics as em
+
+        host = b_tables if b_tables is not None else em.build_tables()
+        cfg = b_config if b_config is not None else cs.Config()
+        fb = cs.make_shower_fn(cs.device_tables(host, jdt), cfg)
+        for i in range(n):
+            t0 = time.perf_counter()
+            dep = cs.to_numpy(fb(jax.random.fold_in(key, i), ke[i], vtx[i], direc[i]))
+            dt_i = time.perf_counter() - t0
+            if t_compile is None:
+                t_compile = dt_i
+            else:
+                t_run += dt_i
+            b_stats["lost_mev"] += dep["lost_mev"]
+            b_stats["peak_max"] = max(b_stats["peak_max"], dep["peak"])
+            b_stats["iters_max"] = max(b_stats["iters_max"], dep["iters"])
+            b_stats["deposits_max"] = max(b_stats["deposits_max"], len(dep["de"]))
+            pos = dep["positions_mm"].astype(np.float64)
+            m = inside(pos, lo, hi)
+            a_rows.append(summarize(pos[m], dep["de"][m].astype(np.float64), vtx[i], direc[i],
+                                    dep["dx"][m].astype(np.float64)))
+        batch = 1
+    f = jax.jit(lambda k, e, v, d: pm.showers(k, e, v, d, n_pairs=n_pairs, dtype=jdt))
+    for b, s in enumerate(range(0, n if model == "A" else 0, batch)):
         idx = np.arange(s, min(s + batch, n))
         pad = batch - len(idx)
         e = np.pad(ke[idx], (0, pad), constant_values=100.0)
@@ -158,7 +183,7 @@ def run(ref_path: str, config: dict, n_pairs: int = 2048, batch: int = 100, seed
             m = inside(pos[j], lo, hi)
             a_rows.append(summarize(pos[j][m], de[j][m], vtx[i], direc[i], dxa[j][m]))
 
-    report = {"events": int(n), "n_pairs": n_pairs, "dtype": dtype,
+    report = {"events": int(n), "model": model, "n_pairs": n_pairs, "dtype": dtype, "option_B": b_stats,
               "timing_s": {"first_batch_incl_compile": t_compile,
                            "per_shower_after_compile": t_run / max(n - batch, 1),
                            "device": str(jax.devices()[0])},
@@ -173,7 +198,7 @@ def run(ref_path: str, config: dict, n_pairs: int = 2048, batch: int = 100, seed
             continue
         name = f"{lo_e:g}-{hi_e:g} MeV"
         report["bins"][name] = {"geant4": _bin_report([ref_rows[i] for i in sel], ke[sel]),
-                                "option_A": _bin_report([a_rows[i] for i in sel], ke[sel])}
+                                f"option_{model}": _bin_report([a_rows[i] for i in sel], ke[sel])}
     return report
 
 
@@ -189,9 +214,10 @@ def plot(report: dict, out_png: str) -> None:
     rc = 0.5 * (np.array(report["r_edges_rm"][1:]) + np.array(report["r_edges_rm"][:-1]))
     fig, ax = plt.subplots(2, len(bins), figsize=(3.6 * len(bins), 6.2), squeeze=False)
     for j, name in enumerate(bins):
-        g, a = report["bins"][name]["geant4"], report["bins"][name]["option_A"]
+        mk = f"option_{report.get('model', 'A')}"
+        g, a = report["bins"][name]["geant4"], report["bins"][name][mk]
         ax[0, j].step(tc, g["t_profile"], where="mid", color="#1f5fa8", label="Geant4 (edep-sim)")
-        ax[0, j].step(tc, a["t_profile"], where="mid", color="#c4561d", label="option A")
+        ax[0, j].step(tc, a["t_profile"], where="mid", color="#c4561d", label=mk.replace("_", " "))
         ax[0, j].set_title(f"{name}  (n={g['events']})", fontsize=9)
         ax[0, j].set_xlabel("depth along electron [X0]", fontsize=8)
         ax[1, j].step(rc, g["r_profile"], where="mid", color="#1f5fa8")
@@ -201,7 +227,7 @@ def plot(report: dict, out_png: str) -> None:
     ax[0, 0].set_ylabel("energy fraction per bin", fontsize=8)
     ax[1, 0].set_ylabel("energy fraction per bin", fontsize=8)
     ax[0, 0].legend(fontsize=7)
-    fig.suptitle("ND-LAr active argon: Geant4 reference vs option A parametric showers (same electrons, same volumes)",
+    fig.suptitle(f"ND-LAr active argon: Geant4 reference vs {mk.replace('_', ' ')} (same electrons, same volumes)",
                  fontsize=10)
     fig.tight_layout()
     fig.savefig(out_png, dpi=130)
@@ -220,10 +246,17 @@ def main(argv=None) -> int:
     p.add_argument("--n-pairs", type=int, default=2048)
     p.add_argument("--dtype", default="float64", choices=["float32", "float64"])
     p.add_argument("--max-events", type=int, default=None)
+    p.add_argument("--model", default="A", choices=["A", "B"])
+    p.add_argument("--n-cap", type=int, default=2048)
+    p.add_argument("--m-cap", type=int, default=1 << 18)
     a = p.parse_args(argv)
     with open(a.config) as fh:
         cfg = yaml.safe_load(fh)
-    rep = run(a.ref, cfg, n_pairs=a.n_pairs, dtype=a.dtype, max_events=a.max_events)
+    b_cfg = None
+    if a.model == "B":
+        from dunefastsim.transport import cascade as cs
+        b_cfg = cs.Config(n_cap=a.n_cap, m_cap=a.m_cap)
+    rep = run(a.ref, cfg, n_pairs=a.n_pairs, dtype=a.dtype, max_events=a.max_events, model=a.model, b_config=b_cfg)
     with open(a.out, "w") as fh:
         json.dump(rep, fh, indent=1)
     if a.png:
@@ -231,8 +264,9 @@ def main(argv=None) -> int:
     short = {k: {s: {m: v[s][m] for m in ("events", "deposited_fraction", "per_event_fraction_q10_50_90",
                                           "mean_depth_x0", "profile_max_x0", "within_1_RM", "within_2_RM",
                                           "dedx_energy_weighted_q10_50_90", "dedx_lognormal")}
-                     for s in ("geant4", "option_A")} for k, v in rep["bins"].items()}
-    print(json.dumps({"timing_s": rep["timing_s"], "ref_dedx": rep["reference_step_dedx_MeV_cm_q10_50_90"],
+                     for s in ("geant4", f"option_{a.model}")} for k, v in rep["bins"].items()}
+    print(json.dumps({"timing_s": rep["timing_s"], "option_B": rep["option_B"],
+                      "ref_dedx": rep["reference_step_dedx_MeV_cm_q10_50_90"],
                       "bins": short}, indent=1))
     return 0
 

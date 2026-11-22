@@ -3,11 +3,11 @@
 Subpackages:
 
 - ``steps``    : the step record (JAXTPC's HDF5 layout) and the edep-sim ROOT converter
-- ``transport``: on-device electron/photon transport in liquid argon (option A: parametric showers)
+- ``transport``: on-device electron/photon transport in liquid argon (option A parametric showers, option B cascade)
 - ``geometry`` : one ND-LAr frame; JAXTPC volume configuration generated from the GDML
 - ``charge``   : adapter over JAXTPC (not vendored)
 - ``light``    : adapter over lumen + lumen-tpc (not vendored)
 - ``ldm``      : thin orchestration over bdnmc-dune (not vendored)
 """
 
-__version__ = "0.0.2"
+__version__ = "0.0.3"

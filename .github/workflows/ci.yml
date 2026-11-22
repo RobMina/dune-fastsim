@@ -36,3 +36,18 @@ jobs:
           echo "JAXTPC_ROOT=$RUNNER_TEMP/JAXTPC" >> "$GITHUB_ENV"
       - run: python -m pip install -U pip && pip install -e '.[test,jax]'
       - run: python -m pytest -q -rs
+
+  pytest-transport:
+    name: pytest (+ option B transport, hep-simkernels)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install (hep-simlib first: hep-simkernels requires it by name)
+        run: |
+          python -m pip install -U pip
+          pip install "hep-simlib @ git+https://github.com/RobMina/hep-simlib.git@b5868350f789f49dfc174110e72d55a40758de67"
+          pip install -e '.[test,jax,transport]'
+      - run: python -m pytest -q -rs
