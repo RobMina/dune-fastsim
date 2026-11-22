@@ -224,8 +224,13 @@ def wentzel_table(nq=601, qmin=1e-10, qmax=0.999):
     return np.log(q), 0.5 * (lo + hi)
 
 
-def build_tables(tcut=0.35, kcut=0.1, t_min=0.05, t_max=1e5, nt=241, k_min=0.05, nk=241, nc=129, nx=129):
-    """Tables for liquid argon with delta production cut ``tcut`` and photon cut ``kcut`` (MeV)."""
+def build_tables(tcut=0.22, kcut=0.1, t_min=0.05, t_max=1e5, nt=241, k_min=0.05, nk=241, nc=129, nx=129):
+    """Tables for liquid argon with delta production cut ``tcut`` and photon cut ``kcut`` (MeV).
+
+    tcut 0.22 MeV is the delta-ray threshold of the Geant4 reference (DUNE ND production edep-sim settings: its
+    lowest delta rays from e+- are 0.22 MeV); it sets where the fluctuated restricted loss ends, so it matters for the
+    dE/dx spread (0.35 MeV gave a 10-20 % wider fixed-length spread). That reference's photon threshold is about
+    10 keV; kcut stays at 0.1 MeV (photons below it barely move the deposits and cost many lanes)."""
     from hepsimkernels import ebrem, eioni, emsc
 
     mat = lar_material()

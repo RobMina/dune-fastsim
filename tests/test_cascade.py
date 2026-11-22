@@ -138,3 +138,36 @@ def test_b0_config_still_runs(host):
     cfg = cs.Config(n_cap=4096, m_cap=1 << 16, fluctuate=False, msc="highland", tsai_angles=False)
     dep = cs.to_numpy(cs.make_shower_fn(tb, cfg)(jax.random.PRNGKey(2), 300.0, jnp.zeros(3), jnp.array([0.0, 1, 0])))
     assert np.isclose(dep["de"].sum(), 300.0, rtol=1e-8)
+
+
+def test_many_showers_one_buffer(host):
+    """B2: primaries of mixed energies (and zero-energy padding) share one buffer; a small fill target makes them
+    queue. Each primary's deposits add up to its energy, nothing is lost, and each primary's track renumbers to 0."""
+    tb = cs.device_tables(host)
+    cfg = cs.Config(n_cap=4096, m_cap=1 << 18, fill=0.05)
+    e = np.array([50.0, 300.0, 0.0, 1000.0, 120.0, 0.0, 2000.0, 75.0])
+    v = np.arange(24.0).reshape(8, 3)
+    d = np.tile([0.0, 0.6, 0.8], (8, 1))
+    out = cs.make_showers_fn(tb, cfg)(jax.random.PRNGKey(4), e, v, d)
+    evs, info = cs.split_events(out, len(e))
+    assert info["deposits"] < cfg.m_cap and info["peak"] < cfg.n_cap
+    for ei, ev in zip(e, evs):
+        assert ev["lost_mev"] == 0.0
+        assert np.isclose(ev["de"].sum(), ei, rtol=1e-8, atol=1e-12), (ei, ev["de"].sum())
+        if ei > 0:
+            assert ev["tid"].min() == 0 and np.any(ev["tid"] == 0)
+    # each shower develops from its own vertex along its direction: 1 GeV centroid 3-5 X0 deep, near the axis
+    ev = evs[3]
+    c = np.average(ev["positions_mm"], axis=0, weights=ev["de"]) - v[3]
+    depth = c @ d[3]
+    assert 3.0 < depth / host.x0_mm < 5.0 and np.linalg.norm(c - depth * d[3]) < 30.0, c
+
+
+def test_single_shower_is_batch_of_one(host):
+    tb = cs.device_tables(host)
+    cfg = cs.Config(n_cap=4096, m_cap=1 << 16)
+    k = jax.random.PRNGKey(8)
+    a = cs.to_numpy(cs.make_shower_fn(tb, cfg)(k, 200.0, jnp.zeros(3), jnp.array([0.0, 0, 1])))
+    evs, _ = cs.split_events(cs.make_showers_fn(tb, cfg)(k, np.array([200.0]), np.zeros((1, 3)),
+                                                         np.array([[0.0, 0, 1]])), 1)
+    assert np.array_equal(a["de"], evs[0]["de"]) and np.array_equal(a["tid"], evs[0]["tid"])

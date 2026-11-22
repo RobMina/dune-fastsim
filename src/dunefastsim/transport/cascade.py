@@ -25,7 +25,11 @@ Physics per step (tables from ``emphysics``; production cuts tcut for deltas and
 Not yet: the mixed (class II) scattering scheme itself, annihilation in flight, photoelectric cross section above ``k_track``, Rayleigh scattering, boundaries (infinite
 argon; the geometry cut is applied downstream as for option A).
 
-Gradients: ``lax.while_loop`` is differentiable in forward mode (``jax.jvp``) only; see the plan (decision 6, B2).
+Many primaries per call (B2, ``showers``): the particle buffer is shared; waiting primaries enter the free lanes
+whenever fewer than ``fill * n_cap`` particles are alive, so small and large showers run side by side and the buffer
+stays full on a GPU. ``shower`` is the one-primary case.
+
+Gradients: ``lax.while_loop`` is differentiable in forward mode (``jax.jvp``) only; see the plan (decision 6).
 """
 
 from __future__ import annotations
@@ -93,6 +97,7 @@ class Config(NamedTuple):
     fluctuate: bool = True  # Urban loss fluctuations (B1)
     msc: str = "wentzel"  # "wentzel" (B1) or "highland" (B0)
     tsai_angles: bool = True  # brem / pair angles (B1); False: collinear (B0)
+    fill: float = 0.25  # B2: new primaries enter only while fewer than fill * n_cap particles are alive
 
 
 class Deposits(NamedTuple):
@@ -101,11 +106,11 @@ class Deposits(NamedTuple):
     dx: jax.Array  # (M,) mm
     dirn: jax.Array  # (M, 3)
     t: jax.Array  # (M,) ns
-    tid: jax.Array  # (M,) track id
-    anc: jax.Array  # (M,) ancestor (always 0 for one primary)
+    tid: jax.Array  # (M,) track id (unique within one call)
+    anc: jax.Array  # (M,) index of the primary the deposit descends from (0 for a single shower)
     pdg: jax.Array  # (M,)
     n: jax.Array  # number written
-    lost_mev: jax.Array  # energy of dropped particles and deposits (overflow)
+    lost_mev: jax.Array  # energy of dropped particles and deposits (overflow); (B,) per primary in ``showers``
     iters: jax.Array
     peak: jax.Array  # largest number of live particles in one iteration
 
@@ -182,9 +187,18 @@ class State(NamedTuple):
     d: jax.Array
     t: jax.Array
     tid: jax.Array
+    sid: jax.Array  # index of each lane's primary
     next_tid: jax.Array
+    q: jax.Array  # next primary waiting to enter (B2)
     dep: Deposits
     key: jax.Array
+
+
+class Primaries(NamedTuple):
+    kind: jax.Array  # (B,)
+    T: jax.Array  # (B,) MeV
+    x: jax.Array  # (B, 3) mm
+    d: jax.Array  # (B, 3) unit
 
 
 def _isum(b):
@@ -323,9 +337,9 @@ def _step(tb: Tables, cfg: Config, st: State) -> State:
         pos=dep.pos.at[idx].set(dpos, mode="drop"), de=dep.de.at[idx].set(de, mode="drop"),
         dx=dep.dx.at[idx].set(ddx, mode="drop"), dirn=dep.dirn.at[idx].set(d, mode="drop"),
         t=dep.t.at[idx].set(st.t, mode="drop"), tid=dep.tid.at[idx].set(st.tid, mode="drop"),
-        anc=dep.anc.at[idx].set(jnp.zeros_like(st.tid), mode="drop"), pdg=dep.pdg.at[idx].set(dpdg, mode="drop"),
+        anc=dep.anc.at[idx].set(st.sid, mode="drop"), pdg=dep.pdg.at[idx].set(dpdg, mode="drop"),
         n=jnp.minimum(dep.n + _isum(has_dep), cfg.m_cap).astype(jnp.int32),
-        lost_mev=dep.lost_mev + jnp.sum(jnp.where(over, de, 0.0)), iters=dep.iters + 1,
+        lost_mev=dep.lost_mev.at[st.sid].add(jnp.where(over, de, 0.0)), iters=dep.iters + 1,
         peak=jnp.maximum(dep.peak, _isum(alive)))
 
     # ------------------------------------------------------------------ next buffer: survivors, then secondaries
@@ -365,8 +379,8 @@ def _step(tb: Tables, cfg: Config, st: State) -> State:
     i_2 = jnp.where(n2, cnt_s + cnt_1 + _icum(n2) - 1, n)
     i_1 = jnp.where(i_1 < n, i_1, n)
     i_2 = jnp.where(i_2 < n, i_2, n)
-    lost = (jnp.sum(jnp.where(n1 & (i_1 >= n), T1 + jnp.where(k1 == E_PLUS, 2 * ME, 0.0), 0.0))
-            + jnp.sum(jnp.where(n2 & (i_2 >= n), T2 + jnp.where(k2 == E_PLUS, 2 * ME, 0.0), 0.0)))
+    lost = (jnp.where(n1 & (i_1 >= n), T1 + jnp.where(k1 == E_PLUS, 2 * ME, 0.0), 0.0)
+            + jnp.where(n2 & (i_2 >= n), T2 + jnp.where(k2 == E_PLUS, 2 * ME, 0.0), 0.0))
     tid1 = st.next_tid + _icum(n1) - 1
     tid2 = st.next_tid + cnt_1 + _icum(n2) - 1
 
@@ -382,36 +396,90 @@ def _step(tb: Tables, cfg: Config, st: State) -> State:
     nd = scatter(jnp.zeros((n, 3), dt).at[:, 2].set(1.0), (i_s, i_1, i_2), (s_d, d1, d2))
     ntm = scatter(jnp.zeros((n,), dt), (i_s, i_1, i_2), (s_t, t1, t1))
     ntid = scatter(jnp.full((n,), -1, st.tid.dtype), (i_s, i_1, i_2), (st.tid, tid1, tid2))
-    dep = dep._replace(lost_mev=dep.lost_mev + lost)
-    return State(nk, nT, nx, nd, ntm, ntid, st.next_tid + cnt_1 + cnt_2, dep, key)
+    nsid = scatter(jnp.zeros((n,), st.sid.dtype), (i_s, i_1, i_2), (st.sid, st.sid, st.sid))
+    dep = dep._replace(lost_mev=dep.lost_mev.at[st.sid].add(lost))
+    return State(nk, nT, nx, nd, ntm, ntid, nsid, st.next_tid + cnt_1 + cnt_2, st.q, dep, key)
+
+
+def _inject(cfg: Config, pr: Primaries, st: State) -> State:
+    """Move waiting primaries into the free lanes (B2). Live particles occupy lanes [0, live) after every step (the
+    rebuild compacts them), so the k new ones go to [live, live + k), k limited by the fill target."""
+    n, nb = cfg.n_cap, pr.T.shape[0]
+    live = _isum(st.kind >= 0)
+    room = jnp.maximum(jnp.int32(max(int(cfg.fill * n), 1)) - live, 0)
+    k = jnp.minimum(room, nb - st.q).astype(jnp.int32)
+    j = jnp.arange(n, dtype=jnp.int32)
+    new = (j >= live) & (j < live + k)
+    p = jnp.clip(st.q + j - live, 0, nb - 1)
+    return st._replace(
+        kind=jnp.where(new, pr.kind[p], st.kind), T=jnp.where(new, pr.T[p], st.T),
+        x=jnp.where(new[:, None], pr.x[p], st.x), d=jnp.where(new[:, None], pr.d[p], st.d),
+        t=jnp.where(new, 0.0, st.t), tid=jnp.where(new, st.next_tid + j - live, st.tid),
+        sid=jnp.where(new, p, st.sid), next_tid=st.next_tid + k, q=st.q + k)
+
+
+def showers(tb: Tables, cfg: Config, key, energy_mev, vertex_mm, direction, primary=E_MINUS) -> Deposits:
+    """Deposits of B primaries (energy (B,), vertex (B, 3), direction (B, 3)) through one particle buffer (B2).
+
+    Primaries enter as lanes free up, so one call keeps the buffer full while showers of very different sizes run.
+    Each deposit's ``anc`` is its primary's index; ``lost_mev`` is (B,). Track ids are unique within the call and a
+    primary's id is lower than any of its descendants'. Zero-energy primaries are harmless padding."""
+    dt = tb.dlnt.dtype
+    n, m = cfg.n_cap, cfg.m_cap
+    e = jnp.atleast_1d(jnp.asarray(energy_mev, dt))
+    nb = e.shape[0]
+    d0 = jnp.broadcast_to(jnp.asarray(direction, dt), (nb, 3))
+    d0 = d0 / jnp.linalg.norm(d0, axis=1, keepdims=True)
+    pr = Primaries(jnp.broadcast_to(jnp.asarray(primary, jnp.int32), (nb,)), e,
+                   jnp.broadcast_to(jnp.asarray(vertex_mm, dt), (nb, 3)), d0)
+    dep = Deposits(jnp.zeros((m, 3), dt), jnp.zeros((m,), dt), jnp.zeros((m,), dt), jnp.zeros((m, 3), dt),
+                   jnp.zeros((m,), dt), jnp.full((m,), -1, jnp.int32), jnp.full((m,), -1, jnp.int32),
+                   jnp.zeros((m,), jnp.int32), jnp.array(0, jnp.int32), jnp.zeros((nb,), dt), jnp.array(0, jnp.int32),
+                   jnp.array(0, jnp.int32))
+    st = State(jnp.full((n,), DEAD, jnp.int32), jnp.zeros((n,), dt), jnp.zeros((n, 3), dt),
+               jnp.zeros((n, 3), dt).at[:, 2].set(1.0), jnp.zeros((n,), dt), jnp.full((n,), -1, jnp.int32),
+               jnp.zeros((n,), jnp.int32), jnp.array(0, jnp.int32), jnp.array(0, jnp.int32), dep, key)
+    st = lax.while_loop(lambda s: (jnp.any(s.kind >= 0) | (s.q < nb)) & (s.dep.iters < cfg.max_iter),
+                        lambda s: _step(tb, cfg, _inject(cfg, pr, s)), st)
+    # anything still alive (or never started) at max_iter counts as lost
+    left = jnp.where(st.kind >= 0, st.T + jnp.where(st.kind == E_PLUS, 2 * ME, 0.0), 0.0)
+    lost = st.dep.lost_mev.at[st.sid].add(left)
+    lost = lost + jnp.where(jnp.arange(nb) >= st.q, e + jnp.where(pr.kind == E_PLUS, 2 * ME, 0.0), 0.0)
+    return st.dep._replace(lost_mev=lost)
 
 
 def shower(tb: Tables, cfg: Config, key, energy_mev, vertex_mm, direction, primary=E_MINUS) -> Deposits:
     """Deposits of one primary electron (or positron / photon) in infinite liquid argon."""
-    dt = tb.dlnt.dtype
-    n, m = cfg.n_cap, cfg.m_cap
-    d0 = jnp.asarray(direction, dt)
-    d0 = d0 / jnp.linalg.norm(d0)
-    kind = jnp.full((n,), DEAD, jnp.int32).at[0].set(primary)
-    T = jnp.zeros((n,), dt).at[0].set(jnp.asarray(energy_mev, dt))
-    x = jnp.zeros((n, 3), dt).at[0].set(jnp.asarray(vertex_mm, dt))
-    d = jnp.zeros((n, 3), dt).at[:, 2].set(1.0).at[0].set(d0)
-    dep = Deposits(jnp.zeros((m, 3), dt), jnp.zeros((m,), dt), jnp.zeros((m,), dt), jnp.zeros((m, 3), dt),
-                   jnp.zeros((m,), dt), jnp.full((m,), -1, jnp.int32), jnp.full((m,), -1, jnp.int32),
-                   jnp.zeros((m,), jnp.int32), jnp.array(0, jnp.int32), jnp.array(0.0, dt), jnp.array(0, jnp.int32),
-                   jnp.array(0, jnp.int32))
-    st = State(kind, T, x, d, jnp.zeros((n,), dt), jnp.full((n,), -1, jnp.int32).at[0].set(0),
-               jnp.array(1, jnp.int32), dep, key)
-    st = lax.while_loop(lambda s: jnp.any(s.kind >= 0) & (s.dep.iters < cfg.max_iter),
-                        lambda s: _step(tb, cfg, s), st)
-    # anything still alive at max_iter counts as lost
-    left = jnp.sum(jnp.where(st.kind >= 0, st.T + jnp.where(st.kind == E_PLUS, 2 * ME, 0.0), 0.0))
-    return st.dep._replace(lost_mev=st.dep.lost_mev + left)
+    dep = showers(tb, cfg, key, jnp.reshape(jnp.asarray(energy_mev), (1,)), jnp.reshape(jnp.asarray(vertex_mm), (1, 3)),
+                  jnp.reshape(jnp.asarray(direction), (1, 3)), primary)
+    return dep._replace(lost_mev=dep.lost_mev[0])
 
 
 def make_shower_fn(tb: Tables, cfg: Config):
     """jit-compiled ``(key, energy, vertex, direction) -> Deposits`` for one electron."""
     return jax.jit(lambda key, e, v, d: shower(tb, cfg, key, e, v, d))
+
+
+def make_showers_fn(tb: Tables, cfg: Config):
+    """jit-compiled ``(key, energies (B,), vertices (B, 3), directions (B, 3)) -> Deposits`` (B2; one compile per B)."""
+    return jax.jit(lambda key, e, v, d: showers(tb, cfg, key, e, v, d))
+
+
+def split_events(dep: Deposits, nb: int):
+    """Per-primary NumPy deposits from a ``showers`` call; track ids renumbered so each primary's is 0."""
+    n = int(dep.n)
+    a = {k: np.asarray(getattr(dep, k))[:n] for k in ("pos", "de", "dx", "dirn", "t", "tid", "anc", "pdg")}
+    lost = np.asarray(dep.lost_mev)
+    order = np.argsort(a["anc"], kind="stable")
+    bounds = np.searchsorted(a["anc"][order], np.arange(nb + 1))
+    out = []
+    for b in range(nb):
+        o = order[bounds[b]:bounds[b + 1]]
+        tid = a["tid"][o]
+        out.append({"positions_mm": a["pos"][o], "de": a["de"][o], "dx": a["dx"][o], "dir": a["dirn"][o],
+                    "t": a["t"][o], "tid": tid - (tid.min() if len(tid) else 0), "pdg": a["pdg"][o],
+                    "lost_mev": float(lost[b])})
+    return out, {"iters": int(dep.iters), "peak": int(dep.peak), "deposits": n}
 
 
 def to_numpy(dep: Deposits):

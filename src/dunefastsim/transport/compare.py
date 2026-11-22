@@ -9,6 +9,12 @@ Per energy bin it reports: the deposited fraction (summed deposits / summed kine
 the energy-weighted mean depth along the electron direction (radiation lengths), the depth of the profile maximum,
 and the fraction of deposits within 1 and 2 Moliere radii (PDG R_M = 9.04 cm) of the axis; and, for the reference,
 the dE/dx of its steps (option A uses one MIP value).
+
+Step-level dE/dx depends on the step length (Geant4's edep-sim segments run from microns to centimetres, option B's
+steps are at most ``s_max``), so for option B the tool also measures dE/dx at a fixed length on both sides
+(``fixed_length_dedx``): each e+- track's deposits are spread uniformly along their step and summed in consecutive
+segments of length L along the track; only full segments count. Reported for every e+- track and for the primary
+electron's first ``PRIMARY_MM`` of track, for L = ``SEG_MM`` (the ND-LAr pixel pitch, 3.72 mm, and 10 mm).
 """
 
 from __future__ import annotations
@@ -25,6 +31,64 @@ E_BINS_MEV = (30.0, 100.0, 300.0, 1000.0, 3000.0, 30000.0)
 T_EDGES = np.linspace(0.0, 25.0, 51)  # X0
 R_EDGES = np.linspace(0.0, 5.0, 51)  # R_M
 LOG_DEDX_EDGES = np.linspace(-1.5, 2.5, 161)  # log10(MeV/cm)
+SEG_MM = (3.72, 10.0)  # fixed dE/dx lengths: ND-LAr pixel pitch (JAXTPC config pixel_pitch 0.372 cm) and 1 cm
+PRIMARY_MM = 50.0  # primary electron: first 5 cm of track
+SEG_EDGES = np.linspace(0.0, 10.0, 201)  # MeV/cm, fixed-length dE/dx histograms (overflow in the last bin)
+
+
+def fixed_length_dedx(tid, t, de, dx, length_mm, first_mm=None, track=None):
+    """dE/dx (MeV/cm) of every full segment of length ``length_mm`` along each track.
+
+    Steps are ordered by (track id, time); each step's energy is spread uniformly over its length; a segment counts
+    only if the track (as recorded: steps outside the active volume are absent on both sides) reaches its end. With
+    ``first_mm`` only segments ending within the first ``first_mm`` of track count; with ``track`` only that track id.
+    """
+    tid, t, de, dx = (np.asarray(a) for a in (tid, t, de, dx))
+    if track is not None:
+        m = tid == track
+        tid, t, de, dx = tid[m], t[m], de[m], dx[m]
+    if len(tid) == 0:
+        return np.zeros(0)
+    o = np.lexsort((t, tid))
+    tid, de, dx = tid[o], de[o].astype(np.float64), np.maximum(dx[o].astype(np.float64), 0.0)
+    new = np.r_[True, tid[1:] != tid[:-1]]
+    trk = np.cumsum(new) - 1
+    c = np.cumsum(dx)
+    b = c - (c - dx)[np.flatnonzero(new)][trk]  # path length at each step's end, from the track's first step
+    a = np.maximum(b - dx, 0.0)  # rounding can put a track's start at -1e-13: no segment -1
+    b = np.maximum(b, a)
+    total = np.zeros(trk[-1] + 1)
+    np.maximum.at(total, trk, b)
+    L = float(length_mm)
+    j0 = np.floor(a / L).astype(np.int64)
+    keys, vals = [], []
+    for k in range(int(np.ceil(dx.max() / L)) + 2 if len(dx) else 1):
+        j = j0 + k
+        ov = np.minimum(b, (j + 1) * L) - np.maximum(a, j * L)
+        w = np.where(dx > 0, np.clip(ov, 0.0, None) / np.where(dx > 0, dx, 1.0), (k == 0) * 1.0)
+        sel = w > 0
+        keys.append(np.stack([trk[sel], j[sel]], 1))
+        vals.append(de[sel] * w[sel])
+    keys, vals = np.concatenate(keys), np.concatenate(vals)
+    u, inv = np.unique(keys, axis=0, return_inverse=True)
+    e = np.bincount(inv.ravel(), weights=vals, minlength=len(u))
+    end = (u[:, 1] + 1) * L
+    ok = (end <= total[u[:, 0]] + 1e-9) & (u[:, 1] >= 0)
+    if first_mm is not None:
+        ok &= end <= first_mm + 1e-9
+    return 10.0 * e[ok] / L
+
+
+def _seg_hists(tid, t, de, dx, pdg, primary_tid):
+    """Fixed-length dE/dx histograms (counts) for all e+- tracks and for the primary's first PRIMARY_MM."""
+    em = np.abs(pdg) == 11
+    out = {}
+    for L in SEG_MM:
+        allv = fixed_length_dedx(tid[em], t[em], de[em], dx[em], L)
+        prim = fixed_length_dedx(tid[em], t[em], de[em], dx[em], L, first_mm=PRIMARY_MM, track=primary_tid)
+        out[f"all_{L:g}"] = np.histogram(np.minimum(allv, SEG_EDGES[-1] - 1e-9), SEG_EDGES)[0]
+        out[f"primary_{L:g}"] = np.histogram(np.minimum(prim, SEG_EDGES[-1] - 1e-9), SEG_EDGES)[0]
+    return out
 
 
 def primaries(path: str):
@@ -52,8 +116,9 @@ def inside(pos: np.ndarray, lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
     return out
 
 
-def summarize(pos, de, vertex, direction, dx_mm=None):
-    """Per-event shower summary in the electron's frame (and the energy-weighted dE/dx histogram when dx is given)."""
+def summarize(pos, de, vertex, direction, dx_mm=None, tracks=None):
+    """Per-event shower summary in the electron's frame (and the energy-weighted dE/dx histogram when dx is given;
+    fixed-length dE/dx histograms when ``tracks`` = (tid, t, pdg, primary tid) is given)."""
     d = pos - vertex
     t_mm = d @ direction
     r_mm = np.linalg.norm(d - np.outer(t_mm, direction), axis=1)
@@ -65,6 +130,7 @@ def summarize(pos, de, vertex, direction, dx_mm=None):
         "t_mean": float(np.sum(de * t_mm) / e / X0_MM) if e > 0 else np.nan,
         "dedx_hist": (np.histogram(np.log10(np.maximum(10.0 * de / np.maximum(dx_mm, 1e-9), 1e-3)), LOG_DEDX_EDGES,
                                    weights=de)[0] if dx_mm is not None else np.zeros(len(LOG_DEDX_EDGES) - 1)),
+        "seg": _seg_hists(tracks[0], tracks[1], de, dx_mm, tracks[2], tracks[3]) if tracks is not None else None,
     }
 
 
@@ -79,6 +145,19 @@ def _lognormal_fit(h, edges):
     w = h / max(h.sum(), 1e-30)
     mu = float(np.sum(w * x))
     return {"median_MeV_cm": float(np.exp(mu)), "sigma_ln": float(np.sqrt(np.sum(w * (x - mu) ** 2)))}
+
+
+def _seg_summary(h):
+    c = np.cumsum(h) / max(h.sum(), 1)
+    x = 0.5 * (SEG_EDGES[1:] + SEG_EDGES[:-1])
+    k = max(int(np.argmax(h)), 1)
+    # mode: parabola through the three bins around the histogram maximum
+    y0, y1, y2 = h[k - 1], h[k], h[min(k + 1, len(h) - 1)]
+    den = y0 - 2 * y1 + y2
+    mode = x[k] + (0.5 * (y0 - y2) / den * (x[1] - x[0]) if den != 0 else 0.0)
+    return {"segments": int(h.sum()), "mpv": round(float(mode), 3),
+            "q10_50_90": [round(float(np.interp(q, c, SEG_EDGES[1:])), 3) for q in (0.1, 0.5, 0.9)],
+            "hist": h.astype(int).tolist()}
 
 
 def _bin_report(rows, ke):
@@ -103,12 +182,33 @@ def _bin_report(rows, ke):
         "dedx_lognormal": _lognormal_fit(dh, LOG_DEDX_EDGES),
         "t_profile": (th / max(th.sum(), 1e-30)).round(6).tolist(),
         "r_profile": (rh / max(rh.sum(), 1e-30)).round(6).tolist(),
+        "fixed_length_dedx": ({k: _seg_summary(np.sum([r["seg"][k] for r in rows], axis=0)) for k in rows[0]["seg"]}
+                              if rows and rows[0].get("seg") is not None else None),
     }
 
 
+def energy_batches(ke, budget_mev: float, b_max: int):
+    """Consecutive event index groups of at most ``b_max`` events and (unless one event exceeds it) ``budget_mev``."""
+    out, cur, tot = [], [], 0.0
+    for i, e in enumerate(ke):
+        if cur and (tot + e > budget_mev or len(cur) >= b_max):
+            out.append(np.array(cur))
+            cur, tot = [], 0.0
+        cur.append(i)
+        tot += e
+    if cur:
+        out.append(np.array(cur))
+    return out
+
+
 def run(ref_path: str, config: dict, n_pairs: int = 2048, batch: int = 100, seed: int = 0, dtype: str = "float64",
-        max_events: int | None = None, model: str = "A", b_config=None, b_tables=None) -> dict:
-    """Compare option A (``model="A"``) or option B (``"B"``) with the reference; return a JSON-able report."""
+        max_events: int | None = None, model: str = "A", b_config=None, b_tables=None, b_batch: int = 1,
+        b_budget_mev: float = 20000.0) -> dict:
+    """Compare option A (``model="A"``) or option B (``"B"``) with the reference; return a JSON-able report.
+
+    Option B runs ``b_batch`` showers per call (B2; padded with zero-energy primaries so one compile serves all
+    calls), at most ``b_budget_mev`` of primary energy per call so the deposit buffer holds them; ``b_batch=1`` is
+    one shower per call as in B0 / B1."""
     import jax
     import jax.numpy as jnp
 
@@ -129,7 +229,10 @@ def run(ref_path: str, config: dict, n_pairs: int = 2048, batch: int = 100, seed
             s = f["pstep/lar_vol"][i]
             pos = np.column_stack([s["x"], s["y"], s["z"]]).astype(np.float64)
             de = s["de"].astype(np.float64)
-            ref_rows.append(summarize(pos, de, vtx[i], direc[i], s["dx"].astype(np.float64)))
+            tracks = None
+            if model == "B":
+                tracks = (s["track_id"], s["t"].astype(np.float64), s["pdg"], int(f["primary/geant4"][i]["track_id"][0]))
+            ref_rows.append(summarize(pos, de, vtx[i], direc[i], s["dx"].astype(np.float64), tracks))
             ok = s["dx"] > 0.05  # mm; drop zero-length steps
             if len(dedx) < 2_000_000:
                 dedx.append(10.0 * s["de"][ok] / s["dx"][ok])  # MeV/cm
@@ -144,24 +247,37 @@ def run(ref_path: str, config: dict, n_pairs: int = 2048, batch: int = 100, seed
 
         host = b_tables if b_tables is not None else em.build_tables()
         cfg = b_config if b_config is not None else cs.Config()
-        fb = cs.make_shower_fn(cs.device_tables(host, jdt), cfg)
-        for i in range(n):
+        fb = cs.make_showers_fn(cs.device_tables(host, jdt), cfg)
+        groups = energy_batches(ke, b_budget_mev, b_batch)
+        b_stats.update(calls=len(groups), batch=b_batch, budget_mev=b_budget_mev, n_cap=cfg.n_cap, m_cap=cfg.m_cap,
+                       fill=cfg.fill, deposits_per_mev_max=0.0)
+        a_rows = [None] * n
+        for g, idx in enumerate(groups):
+            pad = b_batch - len(idx)
+            e = np.pad(ke[idx], (0, pad))
+            v = np.pad(vtx[idx], ((0, pad), (0, 0)))
+            d = np.pad(direc[idx], ((0, pad), (0, 0)), constant_values=1.0)
             t0 = time.perf_counter()
-            dep = cs.to_numpy(fb(jax.random.fold_in(key, i), ke[i], vtx[i], direc[i]))
-            dt_i = time.perf_counter() - t0
+            out = fb(jax.random.fold_in(key, g), e, v, d)
+            evs, info = cs.split_events(out, b_batch)
+            dt_g = time.perf_counter() - t0
             if t_compile is None:
-                t_compile = dt_i
+                t_compile, n_first = dt_g, len(idx)
             else:
-                t_run += dt_i
-            b_stats["lost_mev"] += dep["lost_mev"]
-            b_stats["peak_max"] = max(b_stats["peak_max"], dep["peak"])
-            b_stats["iters_max"] = max(b_stats["iters_max"], dep["iters"])
-            b_stats["deposits_max"] = max(b_stats["deposits_max"], len(dep["de"]))
-            pos = dep["positions_mm"].astype(np.float64)
-            m = inside(pos, lo, hi)
-            a_rows.append(summarize(pos[m], dep["de"][m].astype(np.float64), vtx[i], direc[i],
-                                    dep["dx"][m].astype(np.float64)))
-        batch = 1
+                t_run += dt_g
+            b_stats["lost_mev"] += float(sum(ev["lost_mev"] for ev in evs))
+            b_stats["peak_max"] = max(b_stats["peak_max"], info["peak"])
+            b_stats["iters_max"] = max(b_stats["iters_max"], info["iters"])
+            b_stats["deposits_max"] = max(b_stats["deposits_max"], info["deposits"])
+            b_stats["deposits_per_mev_max"] = max(b_stats["deposits_per_mev_max"], info["deposits"] / ke[idx].sum())
+            for j, i_ev in enumerate(idx):
+                ev = evs[j]
+                pos = ev["positions_mm"].astype(np.float64)
+                m = inside(pos, lo, hi)
+                a_rows[i_ev] = summarize(pos[m], ev["de"][m].astype(np.float64), vtx[i_ev], direc[i_ev],
+                                         ev["dx"][m].astype(np.float64),
+                                         (ev["tid"][m], ev["t"][m].astype(np.float64), ev["pdg"][m], 0))
+        batch = n_first
     f = jax.jit(lambda k, e, v, d: pm.showers(k, e, v, d, n_pairs=n_pairs, dtype=jdt))
     for b, s in enumerate(range(0, n if model == "A" else 0, batch)):
         idx = np.arange(s, min(s + batch, n))
@@ -233,6 +349,35 @@ def plot(report: dict, out_png: str) -> None:
     fig.savefig(out_png, dpi=130)
 
 
+def plot_dedx(report: dict, out_png: str) -> None:
+    """Fixed-length dE/dx, all energies: every e+- track and the primary's first PRIMARY_MM, per segment length."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    mk = f"option_{report.get('model', 'B')}"
+    b = next(iter(report["bins"].values()))
+    keys = list(b["geant4"]["fixed_length_dedx"])
+    x = 0.5 * (SEG_EDGES[1:] + SEG_EDGES[:-1])
+    fig, ax = plt.subplots(1, len(keys), figsize=(3.6 * len(keys), 3.4), squeeze=False)
+    for j, k in enumerate(keys):
+        for side, col, lab in (("geant4", "#1f5fa8", "Geant4 (edep-sim)"), (mk, "#c4561d", mk.replace("_", " "))):
+            s = b[side]["fixed_length_dedx"][k]
+            h = np.array(s["hist"], float)
+            ax[0, j].step(x, h / max(h.sum(), 1), where="mid", color=col,
+                          label=f"{lab}: MPV {s['mpv']:.2f}, median {s['q10_50_90'][1]:.2f}")
+        what, L = k.split("_")
+        ax[0, j].set_title(f"{'all e+- tracks' if what == 'all' else f'primary, first {PRIMARY_MM / 10:g} cm'}, "
+                           f"L = {L} mm", fontsize=9)
+        ax[0, j].set_xlabel("dE/dx over L [MeV/cm]", fontsize=8)
+        ax[0, j].set_xlim(1.0, 4.0)
+        ax[0, j].legend(fontsize=6)
+    ax[0, 0].set_ylabel("segments (normalised)", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=130)
+
+
 def main(argv=None) -> int:
     import argparse
 
@@ -249,23 +394,41 @@ def main(argv=None) -> int:
     p.add_argument("--model", default="A", choices=["A", "B"])
     p.add_argument("--n-cap", type=int, default=2048)
     p.add_argument("--m-cap", type=int, default=1 << 18)
+    p.add_argument("--b-batch", type=int, default=1, help="option B showers per call (B2)")
+    p.add_argument("--b-budget-gev", type=float, default=20.0, help="option B primary energy per call")
+    p.add_argument("--fill", type=float, default=0.25, help="option B: inject primaries below fill * n_cap alive")
+    p.add_argument("--s-max", type=float, default=2.0, help="option B: longest e+- step (mm)")
+    p.add_argument("--no-fluct", action="store_true", help="option B: mean loss, no Urban fluctuations")
+    p.add_argument("--tcut", type=float, default=0.22, help="option B: delta-ray production cut (MeV)")
+    p.add_argument("--kcut", type=float, default=0.1, help="option B: bremsstrahlung photon cut (MeV)")
     a = p.parse_args(argv)
     with open(a.config) as fh:
         cfg = yaml.safe_load(fh)
     b_cfg = None
     if a.model == "B":
         from dunefastsim.transport import cascade as cs
-        b_cfg = cs.Config(n_cap=a.n_cap, m_cap=a.m_cap)
-    rep = run(a.ref, cfg, n_pairs=a.n_pairs, dtype=a.dtype, max_events=a.max_events, model=a.model, b_config=b_cfg)
+        b_cfg = cs.Config(n_cap=a.n_cap, m_cap=a.m_cap, fill=a.fill, s_max=a.s_max, fluctuate=not a.no_fluct)
+    b_tab = None
+    if a.model == "B" and (a.tcut, a.kcut) != (0.22, 0.1):
+        from dunefastsim.transport import emphysics as em
+        b_tab = em.build_tables(tcut=a.tcut, kcut=a.kcut)
+    rep = run(a.ref, cfg, n_pairs=a.n_pairs, dtype=a.dtype, max_events=a.max_events, model=a.model, b_config=b_cfg,
+              b_tables=b_tab,
+              b_batch=a.b_batch, b_budget_mev=1000.0 * a.b_budget_gev)
     with open(a.out, "w") as fh:
         json.dump(rep, fh, indent=1)
     if a.png:
         plot(rep, a.png)
+        if a.model == "B":
+            plot_dedx(rep, a.png.replace(".png", "_dedx.png"))
     short = {k: {s: {m: v[s][m] for m in ("events", "deposited_fraction", "per_event_fraction_q10_50_90",
                                           "mean_depth_x0", "profile_max_x0", "within_1_RM", "within_2_RM",
                                           "dedx_energy_weighted_q10_50_90", "dedx_lognormal")}
                      for s in ("geant4", f"option_{a.model}")} for k, v in rep["bins"].items()}
-    print(json.dumps({"timing_s": rep["timing_s"], "option_B": rep["option_B"],
+    first = next(iter(rep["bins"].values()))
+    seg = {s: {k: {m: v[m] for m in ("segments", "mpv", "q10_50_90")} for k, v in (first[s]["fixed_length_dedx"] or {}).items()}
+           for s in ("geant4", f"option_{a.model}")}
+    print(json.dumps({"timing_s": rep["timing_s"], "option_B": rep["option_B"], "fixed_length_dedx_all_energies": seg,
                       "ref_dedx": rep["reference_step_dedx_MeV_cm_q10_50_90"],
                       "bins": short}, indent=1))
     return 0
