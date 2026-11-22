@@ -9,7 +9,9 @@ Physics per step (tables from ``emphysics``; production cuts tcut for deltas and
 
 - e-/e+: step = min(distance to the next discrete interaction, a fraction of the residual range clipped to
   [s_min, s_max], the residual range). Restricted loss along it: the range-table mean, fluctuated with Geant4's
-  Urban model for e+- (``hepsimkernels.eloss_jax.sample_loss_electron``, B1), deposited at the step midpoint.
+  standard-physics model G4UniversalFluctuation (``fluct.sample_universal``, the option-0 model of the Geant4
+  reference; ``fluct_model="urban"`` keeps the two-level G4UrbanFluctuation of hepsimkernels used up to v0.0.4),
+  deposited at the step midpoint, with the step chord's direction.
   Multiple scattering (B1): the deflection over the step has <1 - cos> = 1 - exp(-s / lambda_1), lambda_1 the
   Mott-corrected first transport mean free path of ``hepsimkernels.emsc``, drawn from a Wentzel (screened-Rutherford)
   distribution with that mean, so the single-scattering tail is kept; the step chord follows the mean of the initial
@@ -93,8 +95,11 @@ class Config(NamedTuple):
     k_track: float = 0.1  # MeV, photon tracking cut (photoelectric: local absorption)
     f_range: float = 0.2  # step <= f_range * residual range ...
     s_min: float = 0.1  # ... but at least s_min (mm) ...
-    s_max: float = 2.0  # ... and at most s_max (mm)
-    fluctuate: bool = True  # Urban loss fluctuations (B1)
+    s_max: float = 10.0  # ... and at most s_max (mm). Decision 7 (user, 2026-11-22): 10 mm, close to Geant4's own
+    # e+- steps in argon (~1 cm for fast electrons), so pixel-scale dE/dx matches DUNE's Geant4 + edep-sim simulation;
+    # 2 mm resolves finer loss fluctuations, 20 mm matches Geant4 exactly but steps across volume boundaries
+    fluctuate: bool = True  # loss fluctuations (B1)
+    fluct_model: str = "universal"  # "universal" (G4UniversalFluctuation, EM option 0) or "urban" (options 3/4)
     msc: str = "wentzel"  # "wentzel" (B1) or "highland" (B0)
     tsai_angles: bool = True  # brem / pair angles (B1); False: collinear (B0)
     fill: float = 0.25  # B2: new primaries enter only while fewer than fill * n_cap particles are alive
@@ -104,7 +109,7 @@ class Deposits(NamedTuple):
     pos: jax.Array  # (M, 3) mm
     de: jax.Array  # (M,) MeV
     dx: jax.Array  # (M,) mm
-    dirn: jax.Array  # (M, 3)
+    dirn: jax.Array  # (M, 3) unit direction of the step chord (e+-), the photon's direction (absorption)
     t: jax.Array  # (M,) ns
     tid: jax.Array  # (M,) track id (unique within one call)
     anc: jax.Array  # (M,) index of the primary the deposit descends from (0 for a single shower)
@@ -233,7 +238,16 @@ def _step(tb: Tables, cfg: Config, st: State) -> State:
     s = jnp.minimum(jnp.minimum(s_int, s_lim), r)
     ranged = s >= r
     T_mean = jnp.minimum(jnp.where(ranged, 0.0, _range_inverse(tb, pos, r - s)), T)
-    if cfg.fluctuate:
+    if cfg.fluctuate and cfg.fluct_model == "universal":
+        from dunefastsim.transport import fluct
+
+        mean = T - T_mean
+        cut = jnp.minimum(tb.tcut, jnp.where(pos, Tsafe, 0.5 * Tsafe))  # min(production cut, Tmax)
+        fl = fluct.sample_universal(kf1, mean, cut, tb.mc.I, tb.mc.e0)
+        loss = jnp.where(ranged, T, jnp.clip(fl, 0.0, T))
+        loss = jnp.where(jnp.isfinite(loss), loss, mean)
+        T_post = jnp.where(charged, T - loss, T_mean)
+    elif cfg.fluctuate:
         from hepsimkernels import eloss_jax
 
         mean = T - T_mean
@@ -327,6 +341,8 @@ def _step(tb: Tables, cfg: Config, st: State) -> State:
     de = jnp.where(charged, c_de, g_de)
     has_dep = alive & (de > 0)
     dpos = jnp.where(charged[:, None], c_mid, x)
+    cn = jnp.linalg.norm(chord, axis=1, keepdims=True)
+    ddir = jnp.where(charged[:, None] & (cn > 1e-12), chord / jnp.maximum(cn, 1e-12), d)  # the step chord
     ddx = jnp.where(charged, jnp.maximum(s, 1e-6), 1e-3)
     dpdg = jnp.where(kind == E_PLUS, -11, jnp.where(kind == E_MINUS, 11, 22))
     dep = st.dep
@@ -335,7 +351,7 @@ def _step(tb: Tables, cfg: Config, st: State) -> State:
     over = has_dep & (off >= cfg.m_cap)
     dep = dep._replace(
         pos=dep.pos.at[idx].set(dpos, mode="drop"), de=dep.de.at[idx].set(de, mode="drop"),
-        dx=dep.dx.at[idx].set(ddx, mode="drop"), dirn=dep.dirn.at[idx].set(d, mode="drop"),
+        dx=dep.dx.at[idx].set(ddx, mode="drop"), dirn=dep.dirn.at[idx].set(ddir, mode="drop"),
         t=dep.t.at[idx].set(st.t, mode="drop"), tid=dep.tid.at[idx].set(st.tid, mode="drop"),
         anc=dep.anc.at[idx].set(st.sid, mode="drop"), pdg=dep.pdg.at[idx].set(dpdg, mode="drop"),
         n=jnp.minimum(dep.n + _isum(has_dep), cfg.m_cap).astype(jnp.int32),

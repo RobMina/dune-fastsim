@@ -2,6 +2,7 @@
 
 import numpy as np
 
+from dunefastsim.transport import compare as C
 from dunefastsim.transport.compare import energy_batches, fixed_length_dedx
 
 
@@ -67,3 +68,42 @@ def test_matches_brute_force_many_tracks():
     de = 0.19 * dx * rng.lognormal(0, 0.3, n)
     for L in (3.72, 10.0):
         assert np.allclose(np.sort(fixed_length_dedx(tid, t, de, dx, L)), _brute(tid, t, de, dx, L))
+
+
+# ---------------------------------------------------------------------------------------- edep-sim step merging
+def _line(tid, n, step, d, start=(0.0, 0.0, 0.0), t0=0.0):
+    d = np.asarray(d, float) / np.linalg.norm(d)
+    ends = np.asarray(start) + np.outer(np.arange(1, n + 1) * step, d)
+    mids = ends - 0.5 * step * d
+    return (np.full(n, tid), t0 + np.arange(n, dtype=float), mids, np.full(n, 0.1), np.full(n, step), np.tile(d, (n, 1)))
+
+
+def _cat(*parts):
+    return tuple(np.concatenate([p[k] for p in parts]) for k in range(6))
+
+
+def test_merge_straight_track_into_3mm_segments():
+    tid, t, pos, de, dx, d = _line(4, 20, 0.5, [1, 0, 0])
+    mt, mtt, mde, mdx = C.edepsim_segments(tid, t, pos, de, dx, d)
+    assert np.allclose(mdx, [3.0, 3.0, 3.0, 1.0]) and np.allclose(mde, [0.6, 0.6, 0.6, 0.2])
+    assert np.all(mt == 4) and np.allclose(mtt, [0, 6, 12, 18])
+
+
+def test_merge_splits_at_a_kink_beyond_the_sagitta():
+    a = _line(1, 3, 0.5, [1, 0, 0])  # 1.5 mm along x, then along y from (1.5, 0, 0)
+    b = _line(1, 8, 0.5, [0, 1, 0], start=(1.5, 0.0, 0.0), t0=3.0)
+    mt, mtt, mde, mdx = C.edepsim_segments(*_cat(a, b))
+    assert np.allclose(mdx, [1.5, 3.0, 1.0])  # the x leg, then the y leg in 3 mm pieces
+
+
+def test_merge_never_joins_tracks_and_keeps_energy():
+    rng = np.random.default_rng(5)
+    parts = [_line(k, int(rng.integers(1, 30)), float(rng.uniform(0.1, 2.0)), rng.normal(size=3),
+                   start=rng.normal(size=3), t0=float(k)) for k in range(6)]
+    tid, t, pos, de, dx, d = _cat(*parts)
+    de = rng.uniform(0.01, 0.5, len(tid))
+    o = rng.permutation(len(tid))  # input order does not matter
+    mt, mtt, mde, mdx = C.edepsim_segments(tid[o], t[o], pos[o], de[o], dx[o], d[o])
+    for k in range(6):
+        assert np.isclose(mde[mt == k].sum(), de[tid == k].sum()) and np.isclose(mdx[mt == k].sum(), dx[tid == k].sum())
+        assert np.all(mdx[mt == k] <= 3.0 + 1e-9)

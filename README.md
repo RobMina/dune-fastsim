@@ -19,7 +19,7 @@ This package **depends on** those projects and vendors none of them. What it add
 Public material only: no collaboration-internal geometry, configuration or results. Site paths come from
 `site.env` (see `site.env.example`), never from the code.
 
-## Status (v0.0.4)
+## Status (v0.0.5)
 
 | Piece | State |
 |---|---|
@@ -29,7 +29,7 @@ Public material only: no collaboration-internal geometry, configuration or resul
 | `steps.validate`, `dunefastsim steps-validate` | energy sums and containment of steps in a JAXTPC config's drift volumes |
 | `transport.parametric` (option A) | GFLASH parametric showers in liquid argon plus a leading track, a fluctuation ramp, a dE/dx spread and a photon conversion delay; differentiable, f32/f64; compared with Geant4 (below) |
 | `transport.compare` | option A or B against a Geant4 reference in the step format: deposited fraction, longitudinal and radial profiles, dE/dx, dE/dx over fixed lengths (3.72 mm pixel pitch, 10 mm), per energy bin |
-| `transport.emphysics` + `transport.cascade` (option B) | condensed-history electron/photon cascade in JAX: e± physics from [hep-simkernels](https://github.com/RobMina/hep-simkernels) up to 1 GeV (Moller/Bhabha, Seltzer-Berger, Mott-corrected transport cross section, Urban fluctuations), Tsai bremsstrahlung above, Klein-Nishina Compton, Bethe-Heitler pair; Wentzel multiple scattering with lateral displacement, modified-Tsai emission angles; fixed-capacity particle and deposit buffers with overflow accounting; energy conserved per shower; many showers share one buffer (new primaries enter as lanes free up); extra `[transport]` |
+| `transport.emphysics` + `transport.cascade` (option B) | condensed-history electron/photon cascade in JAX: e± physics from [hep-simkernels](https://github.com/RobMina/hep-simkernels) up to 1 GeV (Moller/Bhabha, Seltzer-Berger, Mott-corrected transport cross section, Urban fluctuations; Geant4's option-0 G4UniversalFluctuation from v0.0.5), Tsai bremsstrahlung above, Klein-Nishina Compton, Bethe-Heitler pair; Wentzel multiple scattering with lateral displacement, modified-Tsai emission angles; fixed-capacity particle and deposit buffers with overflow accounting; energy conserved per shower; many showers share one buffer (new primaries enter as lanes free up); extra `[transport]` |
 | `geometry` JAXTPC volumes from the GDML | done; on DUNE's hall GDML v2026.03.06 every Geant4 step in the active argon lands in exactly one generated drift volume |
 | `charge` (JAXTPC) | status check only; no simulation run yet |
 | `light` (lumen 0.2 + lumen-tpc `dune_ndlar`) | status check only |
@@ -48,36 +48,51 @@ About 4 ms per shower in float32 on 4 CPU cores.
 ### Option B against Geant4
 
 Full samples (2000 electrons each, 34 MeV to 22 GeV; one from pi0 decays, one from eta decays), same drift volumes,
-float64. Delta-ray production threshold 0.22 MeV, the same as the Geant4 reference.
+float64, v0.0.5 defaults: longest e± step 10 mm, Geant4's option-0 fluctuation model, delta rays from 0.22 MeV (all
+three as in the Geant4 reference).
 
 | | pi0 sample, Geant4 | pi0 sample, option B | eta sample, Geant4 | eta sample, option B |
 |---|---|---|---|---|
-| deposited fraction | 0.740 | 0.752 | 0.714 | 0.720 |
-| mean depth (X0) | 4.79 | 4.74 | 5.97 | 5.96 |
-| within 1 Moliere radius | 0.865 | 0.873 | 0.867 | 0.874 |
+| deposited fraction | 0.740 | 0.750 | 0.714 | 0.720 |
+| mean depth (X0) | 4.79 | 4.79 | 5.97 | 5.95 |
+| within 1 Moliere radius | 0.865 | 0.877 | 0.867 | 0.877 |
 
-dE/dx summed over fixed lengths of e± track (pi0 sample; eta sample the same within 0.02 MeV/cm), in MeV/cm:
+dE/dx summed over fixed lengths of e± track (pi0 sample; eta sample the same within 0.01 MeV/cm), in MeV/cm:
 
 | segments | Geant4 MPV | Geant4 q10 / q50 / q90 | option B MPV | option B q10 / q50 / q90 |
 |---|---|---|---|---|
-| all tracks, 3.72 mm | 1.84 | 1.64 / 1.85 / 2.10 | 1.74 | 1.59 / 1.81 / 2.18 |
-| all tracks, 10 mm | 1.84 | 1.68 / 1.85 / 2.04 | 1.81 | 1.66 / 1.84 / 2.07 |
-| primary, first 5 cm, 10 mm | 1.89 | 1.77 / 1.91 / 2.09 | 1.85 | 1.74 / 1.91 / 2.13 |
+| all tracks, 3.72 mm (pixel pitch) | 1.838 | 1.640 / 1.848 / 2.099 | 1.809 | 1.624 / 1.835 / 2.102 |
+| all tracks, 10 mm | 1.840 | 1.677 / 1.847 / 2.035 | 1.822 | 1.669 / 1.842 / 2.048 |
+| primary, first 5 cm, 3.72 mm | 1.884 | 1.743 / 1.904 / 2.112 | 1.871 | 1.725 / 1.900 / 2.145 |
 
-Segment counts agree within 2.5 %. Over 10 mm the two agree; over one pixel pitch option B's most probable value is
-5 % low and its high tail longer. Changing the maximum step from 0.5 to 5 mm moves this little; the energy-loss fluctuation
-model is the next thing to check.
+**Step length.** Geant4 takes long steps for fast electrons in argon (the primary's: median 4.8 mm, energy-weighted
+mean 13 mm) and a step's energy is spread evenly along it, so the reference has no energy-loss fluctuations below
+about a centimetre. With 2 mm steps (v0.0.4) option B resolved them and its pixel-pitch MPV came out 5.6 % below
+Geant4's; with 20 mm it reproduces Geant4 at every length, but steps that long cross active-volume edges whole
+(deposited fraction 0.898 vs 0.937 for 1 GeV electrons); 10 mm (the default) leaves 1.6 %. Checked with Geant4
+directly and ruled out on the way: the fluctuation model (the two-level G4UrbanFluctuation of hepsimkernels gives the
+same dE/dx; `--fluct urban`), the Geant4 version (the model is identical in 11.3.2 and 11.4.0) and edep-sim's merging
+of steps into 3 mm segments (turning it off changes nothing).
 
-Speed, 64 showers per call in one 8192-lane buffer, no energy lost to buffer overflow:
+**Passive material.** Option B has no geometry: everything is liquid argon, and deposits outside the drift volumes
+are dropped. Between modules along the beam the reference has 2 x 1.03 cm of ArCLight (plastic), 2 x 0.635 cm of G10
+and 1 cm of inactive argon (0.19 X0, against 0.31 X0 of argon in option B). Measured with 500 electrons of 1 GeV whose
+showers peak at a module wall or mid-module: the wall costs Geant4 2.70 points of deposited energy and option B 2.98,
+and shortens option B's showers by a further 0.08 X0 (mean depth 4.26 vs 4.45 X0 at the wall, 4.10 vs 4.21
+mid-module). Smaller than option B's other residuals (deposited fraction 0.6-1 point high and 1 Moliere radius
+containment 1 point high at every energy); 2 mm steps do no better at the wall.
+
+Speed, 64 showers per call in one buffer, no energy lost to buffer overflow:
 
 | | pi0 sample | eta sample (higher energies) |
 |---|---|---|
-| 4 CPU cores, float64 | 0.37 s per shower | 1.27 s |
-| one RTX A6000, float32 | 17 ms per shower | 61 ms |
+| 4 CPU cores, float64, 10 mm steps (16384 lanes) | 0.11 s per shower | 0.34 s |
+| 4 CPU cores, float64, 2 mm steps (8192 lanes, v0.0.4) | 0.37 s | 1.27 s |
+| one RTX A6000, float32, 2 mm steps (v0.0.4) | 17 ms | 61 ms |
 
-One shower at a time on CPU took 3-5 s. Float32 on the GPU gives the same physics as float64 on CPU (deposited
-fraction 0.751 vs 0.752, within 1 Moliere radius 0.872 vs 0.873, dE/dx quantiles within 0.01 MeV/cm). The buffer
-was sized for CPU and peaked at half full; larger buffers on the GPU are untried.
+One shower at a time on CPU took 3-5 s. Float32 on the GPU gave the same physics as float64 on CPU (deposited
+fraction 0.751 vs 0.752, within 1 Moliere radius 0.872 vs 0.873, dE/dx quantiles within 0.01 MeV/cm). With 10 mm
+steps more of a shower's particles are alive at once: the buffer needs about 1.4 x as many lanes (peak 11245).
 
 ### Known issue: two ND-LAr layouts
 

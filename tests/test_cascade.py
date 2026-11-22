@@ -73,11 +73,13 @@ def test_energy_conserved(host, dtype, tol, energy):
 def test_shower_shape_1gev(host):
     """Energy-weighted depth of a few 1 GeV showers: 3-5 X0 (GFLASH / Geant4 give about 3.6-4)."""
     tb = cs.device_tables(host)
-    f = cs.make_shower_fn(tb, cs.Config(n_cap=4096, m_cap=1 << 16))
-    depth = []
-    for i in range(8):
-        dep = cs.to_numpy(f(jax.random.PRNGKey(10 + i), 1000.0, jnp.zeros(3), jnp.array([0.0, 0, 1])))
-        depth.append(np.average(dep["positions_mm"][:, 2], weights=dep["de"]) / host.x0_mm)
+    # 32 showers in one buffer: one shower's depth scatters by ~1.5 X0, so 8 showers left +-0.5 X0 of noise
+    nb = 32
+    f = cs.make_showers_fn(tb, cs.Config(n_cap=8192, m_cap=1 << 20, fill=0.5))
+    out = f(jax.random.PRNGKey(10), np.full(nb, 1000.0), np.zeros((nb, 3)), np.tile([0.0, 0.0, 1.0], (nb, 1)))
+    evs, info = cs.split_events(out, nb)
+    assert info["deposits"] < (1 << 20) and all(ev["lost_mev"] == 0.0 for ev in evs)
+    depth = [np.average(ev["positions_mm"][:, 2], weights=ev["de"]) / host.x0_mm for ev in evs]
     assert 3.0 < np.mean(depth) < 5.0, depth
 
 
@@ -146,7 +148,7 @@ def test_many_showers_one_buffer(host):
     tb = cs.device_tables(host)
     cfg = cs.Config(n_cap=4096, m_cap=1 << 18, fill=0.05)
     e = np.array([50.0, 300.0, 0.0, 1000.0, 120.0, 0.0, 2000.0, 75.0])
-    v = np.arange(24.0).reshape(8, 3)
+    v = np.column_stack([10000.0 * np.arange(8), np.zeros(8), np.zeros(8)])  # vertices 10 m apart
     d = np.tile([0.0, 0.6, 0.8], (8, 1))
     out = cs.make_showers_fn(tb, cfg)(jax.random.PRNGKey(4), e, v, d)
     evs, info = cs.split_events(out, len(e))
@@ -156,11 +158,18 @@ def test_many_showers_one_buffer(host):
         assert np.isclose(ev["de"].sum(), ei, rtol=1e-8, atol=1e-12), (ei, ev["de"].sum())
         if ei > 0:
             assert ev["tid"].min() == 0 and np.any(ev["tid"] == 0)
-    # each shower develops from its own vertex along its direction: 1 GeV centroid 3-5 X0 deep, near the axis
-    ev = evs[3]
-    c = np.average(ev["positions_mm"], axis=0, weights=ev["de"]) - v[3]
+    # each primary's deposits belong to its own shower: the primary's first step starts at its vertex, every deposit
+    # lies within 5 m of it (the next vertex is 10 m away), and the shower goes along its direction (one 1 GeV
+    # shower's depth scatters by ~1.5 X0, so only a wide window)
+    for k, (ei, ev) in enumerate(zip(e, evs)):
+        if ei == 0:
+            continue
+        p0 = ev["positions_mm"][ev["tid"] == 0][np.argmin(ev["t"][ev["tid"] == 0])]
+        assert np.linalg.norm(p0 - v[k]) <= 0.5 * cfg.s_max + 1e-6, (k, p0)
+        assert np.linalg.norm(ev["positions_mm"] - v[k], axis=1).max() < 5000.0, k
+    c = np.average(evs[3]["positions_mm"], axis=0, weights=evs[3]["de"]) - v[3]
     depth = c @ d[3]
-    assert 3.0 < depth / host.x0_mm < 5.0 and np.linalg.norm(c - depth * d[3]) < 30.0, c
+    assert 2.0 < depth / host.x0_mm < 8.0 and np.linalg.norm(c - depth * d[3]) < 50.0, c
 
 
 def test_single_shower_is_batch_of_one(host):

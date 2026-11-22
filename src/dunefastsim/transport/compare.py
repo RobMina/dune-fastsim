@@ -15,6 +15,13 @@ steps are at most ``s_max``), so for option B the tool also measures dE/dx at a 
 (``fixed_length_dedx``): each e+- track's deposits are spread uniformly along their step and summed in consecutive
 segments of length L along the track; only full segments count. Reported for every e+- track and for the primary
 electron's first ``PRIMARY_MM`` of track, for L = ``SEG_MM`` (the ND-LAr pixel pitch, 3.72 mm, and 10 mm).
+
+The reference's "steps" are edep-sim hit segments, not Geant4 steps: edep-sim's segment detector merges consecutive
+Geant4 steps of one track while the segment stays within 3 mm end to end and 1 mm sagitta (its defaults; DUNE's ND
+production keeps them and sets only hitSeparation -1 mm, so different tracks are never merged). Spreading a merged
+segment's energy uniformly smooths the fixed-length dE/dx over lengths comparable to 3 mm. ``edepsim_segments``
+applies the same merging to option B's steps, and the report carries option B's fixed-length dE/dx both as stepped
+(``fixed_length_dedx``) and after the merging (``fixed_length_dedx_edepsim``), the like-for-like comparison.
 """
 
 from __future__ import annotations
@@ -77,6 +84,65 @@ def fixed_length_dedx(tid, t, de, dx, length_mm, first_mm=None, track=None):
     if first_mm is not None:
         ok &= end <= first_mm + 1e-9
     return 10.0 * e[ok] / L
+
+
+EDEPSIM_MAX_LENGTH_MM = 3.0  # EDepSim::SegmentSD fMaximumHitLength default
+EDEPSIM_MAX_SAGITTA_MM = 1.0  # EDepSim::SegmentSD fMaximumHitSagitta default
+
+
+def edepsim_segments(tid, t, pos, de, dx, dirn, max_length=EDEPSIM_MAX_LENGTH_MM, max_sagitta=EDEPSIM_MAX_SAGITTA_MM,
+                     kmax=48):
+    """Merge consecutive steps of each track as edep-sim's EDepSim::HitSegment::SameHit does (same track, segment
+    front to new post-step point <= max_length, every recorded path point within max_sagitta of the line through the
+    front along the new step's direction); returns per-segment (tid, t, de, dx) with t the first step's time and dx
+    the summed step lengths. Step end points are pos -/+ dirn dx / 2 (pos the step midpoint, dirn the chord
+    direction). Vectorised over tracks, one pass per step index; a segment holds at most kmax - 1 steps."""
+    tid, t, de, dx = (np.asarray(a) for a in (tid, t, de, dx))
+    n = len(tid)
+    if n == 0:
+        return tid, t, de, dx
+    o = np.lexsort((t, tid))
+    tid, t, de, dx = tid[o], t[o], de[o].astype(np.float64), dx[o].astype(np.float64)
+    pos, u = np.asarray(pos, np.float64)[o], np.asarray(dirn, np.float64)[o]
+    u = u / np.maximum(np.linalg.norm(u, axis=1, keepdims=True), 1e-30)
+    pre, post = pos - 0.5 * dx[:, None] * u, pos + 0.5 * dx[:, None] * u
+    starts = np.flatnonzero(np.r_[True, tid[1:] != tid[:-1]])
+    nst = np.diff(np.r_[starts, n])
+    ntr = len(starts)
+    gid = np.empty(n, np.int64)
+    front = np.zeros((ntr, 3))
+    buf = np.zeros((ntr, kmax, 3))
+    cnt = np.zeros(ntr, np.int64)
+    nxt = 0
+    for k in range(int(nst.max())):
+        act = np.flatnonzero(nst > k)
+        i = starts[act] + k
+        if k == 0:
+            same = np.zeros(len(act), bool)
+        else:
+            e2e = np.linalg.norm(post[i] - front[act], axis=1)
+            back = buf[act, cnt[act] - 1]
+            nd = post[i] - back
+            nd /= np.maximum(np.linalg.norm(nd, axis=1, keepdims=True), 1e-30)
+            delta = buf[act] - front[act][:, None, :]
+            dist = np.einsum("akc,ac->ak", delta, nd)
+            perp = np.linalg.norm(delta - dist[:, :, None] * nd[:, None, :], axis=2)
+            perp = np.where(np.arange(kmax)[None, :] < cnt[act][:, None], perp, 0.0)
+            same = (e2e <= max_length) & (perp.max(axis=1) <= max_sagitta) & (cnt[act] < kmax)
+        a_s, i_s = act[same], i[same]
+        gid[i_s] = gid[i_s - 1]
+        buf[a_s, cnt[a_s]] = post[i_s]
+        cnt[a_s] += 1
+        a_n, i_n = act[~same], i[~same]
+        gid[i_n] = nxt + np.arange(len(i_n))
+        nxt += len(i_n)
+        front[a_n] = pre[i_n]
+        buf[a_n, 0] = pre[i_n]
+        buf[a_n, 1] = post[i_n]
+        cnt[a_n] = 2
+    first = np.r_[True, gid[1:] != gid[:-1]]  # gid is constant over each run of merged steps
+    return (tid[first], t[first], np.bincount(gid, weights=de, minlength=nxt)[gid[first]],
+            np.bincount(gid, weights=dx, minlength=nxt)[gid[first]])
 
 
 def _seg_hists(tid, t, de, dx, pdg, primary_tid):
@@ -184,6 +250,9 @@ def _bin_report(rows, ke):
         "r_profile": (rh / max(rh.sum(), 1e-30)).round(6).tolist(),
         "fixed_length_dedx": ({k: _seg_summary(np.sum([r["seg"][k] for r in rows], axis=0)) for k in rows[0]["seg"]}
                               if rows and rows[0].get("seg") is not None else None),
+        **({"fixed_length_dedx_edepsim": {k: _seg_summary(np.sum([r["seg_edepsim"][k] for r in rows], axis=0))
+                                          for k in rows[0]["seg_edepsim"]}}
+           if rows and rows[0].get("seg_edepsim") is not None else {}),
     }
 
 
@@ -203,12 +272,13 @@ def energy_batches(ke, budget_mev: float, b_max: int):
 
 def run(ref_path: str, config: dict, n_pairs: int = 2048, batch: int = 100, seed: int = 0, dtype: str = "float64",
         max_events: int | None = None, model: str = "A", b_config=None, b_tables=None, b_batch: int = 1,
-        b_budget_mev: float = 20000.0) -> dict:
+        b_budget_mev: float = 20000.0, b_edepsim_merge: bool = True) -> dict:
     """Compare option A (``model="A"``) or option B (``"B"``) with the reference; return a JSON-able report.
 
     Option B runs ``b_batch`` showers per call (B2; padded with zero-energy primaries so one compile serves all
     calls), at most ``b_budget_mev`` of primary energy per call so the deposit buffer holds them; ``b_batch=1`` is
-    one shower per call as in B0 / B1."""
+    one shower per call as in B0 / B1. ``b_edepsim_merge``: also report option B's fixed-length dE/dx after
+    edep-sim's step merging (``edepsim_segments``), as the reference's segments are."""
     import jax
     import jax.numpy as jnp
 
@@ -277,6 +347,11 @@ def run(ref_path: str, config: dict, n_pairs: int = 2048, batch: int = 100, seed
                 a_rows[i_ev] = summarize(pos[m], ev["de"][m].astype(np.float64), vtx[i_ev], direc[i_ev],
                                          ev["dx"][m].astype(np.float64),
                                          (ev["tid"][m], ev["t"][m].astype(np.float64), ev["pdg"][m], 0))
+                if b_edepsim_merge:
+                    em_ = m & (np.abs(ev["pdg"]) == 11)
+                    mt, mtt, mde, mdx = edepsim_segments(ev["tid"][em_], ev["t"][em_].astype(np.float64), pos[em_],
+                                                         ev["de"][em_], ev["dx"][em_], ev["dir"][em_])
+                    a_rows[i_ev]["seg_edepsim"] = _seg_hists(mt, mtt, mde, mdx, np.full(len(mt), 11), 0)
         batch = n_first
     f = jax.jit(lambda k, e, v, d: pm.showers(k, e, v, d, n_pairs=n_pairs, dtype=jdt))
     for b, s in enumerate(range(0, n if model == "A" else 0, batch)):
@@ -367,6 +442,12 @@ def plot_dedx(report: dict, out_png: str) -> None:
             h = np.array(s["hist"], float)
             ax[0, j].step(x, h / max(h.sum(), 1), where="mid", color=col,
                           label=f"{lab}: MPV {s['mpv']:.2f}, median {s['q10_50_90'][1]:.2f}")
+        if "fixed_length_dedx_edepsim" in b[mk]:
+            s = b[mk]["fixed_length_dedx_edepsim"][k]
+            h = np.array(s["hist"], float)
+            ax[0, j].step(x, h / max(h.sum(), 1), where="mid", color="#c4561d", ls="--",
+                          label=f"{mk.replace('_', ' ')}, edep-sim 3 mm merging: MPV {s['mpv']:.2f}, "
+                                f"median {s['q10_50_90'][1]:.2f}")
         what, L = k.split("_")
         ax[0, j].set_title(f"{'all e+- tracks' if what == 'all' else f'primary, first {PRIMARY_MM / 10:g} cm'}, "
                            f"L = {L} mm", fontsize=9)
@@ -397,8 +478,11 @@ def main(argv=None) -> int:
     p.add_argument("--b-batch", type=int, default=1, help="option B showers per call (B2)")
     p.add_argument("--b-budget-gev", type=float, default=20.0, help="option B primary energy per call")
     p.add_argument("--fill", type=float, default=0.25, help="option B: inject primaries below fill * n_cap alive")
-    p.add_argument("--s-max", type=float, default=2.0, help="option B: longest e+- step (mm)")
-    p.add_argument("--no-fluct", action="store_true", help="option B: mean loss, no Urban fluctuations")
+    p.add_argument("--s-max", type=float, default=10.0, help="option B: longest e+- step (mm)")
+    p.add_argument("--no-fluct", action="store_true", help="option B: mean loss, no fluctuations")
+    p.add_argument("--fluct", default="universal", choices=["universal", "urban"],
+                   help="option B: G4UniversalFluctuation (EM option 0, the reference's) or G4UrbanFluctuation")
+    p.add_argument("--no-merge", action="store_true", help="option B: skip the edep-sim merged dE/dx")
     p.add_argument("--tcut", type=float, default=0.22, help="option B: delta-ray production cut (MeV)")
     p.add_argument("--kcut", type=float, default=0.1, help="option B: bremsstrahlung photon cut (MeV)")
     a = p.parse_args(argv)
@@ -407,14 +491,15 @@ def main(argv=None) -> int:
     b_cfg = None
     if a.model == "B":
         from dunefastsim.transport import cascade as cs
-        b_cfg = cs.Config(n_cap=a.n_cap, m_cap=a.m_cap, fill=a.fill, s_max=a.s_max, fluctuate=not a.no_fluct)
+        b_cfg = cs.Config(n_cap=a.n_cap, m_cap=a.m_cap, fill=a.fill, s_max=a.s_max, fluctuate=not a.no_fluct,
+                          fluct_model=a.fluct)
     b_tab = None
     if a.model == "B" and (a.tcut, a.kcut) != (0.22, 0.1):
         from dunefastsim.transport import emphysics as em
         b_tab = em.build_tables(tcut=a.tcut, kcut=a.kcut)
     rep = run(a.ref, cfg, n_pairs=a.n_pairs, dtype=a.dtype, max_events=a.max_events, model=a.model, b_config=b_cfg,
               b_tables=b_tab,
-              b_batch=a.b_batch, b_budget_mev=1000.0 * a.b_budget_gev)
+              b_batch=a.b_batch, b_budget_mev=1000.0 * a.b_budget_gev, b_edepsim_merge=not a.no_merge)
     with open(a.out, "w") as fh:
         json.dump(rep, fh, indent=1)
     if a.png:
@@ -428,6 +513,9 @@ def main(argv=None) -> int:
     first = next(iter(rep["bins"].values()))
     seg = {s: {k: {m: v[m] for m in ("segments", "mpv", "q10_50_90")} for k, v in (first[s]["fixed_length_dedx"] or {}).items()}
            for s in ("geant4", f"option_{a.model}")}
+    if "fixed_length_dedx_edepsim" in first[f"option_{a.model}"]:
+        seg[f"option_{a.model}_edepsim_merged"] = {k: {m: v[m] for m in ("segments", "mpv", "q10_50_90")}
+                                                   for k, v in first[f"option_{a.model}"]["fixed_length_dedx_edepsim"].items()}
     print(json.dumps({"timing_s": rep["timing_s"], "option_B": rep["option_B"], "fixed_length_dedx_all_energies": seg,
                       "ref_dedx": rep["reference_step_dedx_MeV_cm_q10_50_90"],
                       "bins": short}, indent=1))
