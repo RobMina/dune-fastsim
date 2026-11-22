@@ -45,7 +45,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install (hep-simlib first: hep-simkernels requires it by name)
+      - name: Install hep-simlib first, then the transport extra (hep-simkernels requires hep-simlib by name)
         run: |
           python -m pip install -U pip
           pip install "hep-simlib @ git+https://github.com/RobMina/hep-simlib.git@b5868350f789f49dfc174110e72d55a40758de67"
