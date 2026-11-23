@@ -484,7 +484,9 @@ def main(argv=None) -> int:
                    help="option B: G4UniversalFluctuation (EM option 0, the reference's) or G4UrbanFluctuation")
     p.add_argument("--no-merge", action="store_true", help="option B: skip the edep-sim merged dE/dx")
     p.add_argument("--tcut", type=float, default=0.22, help="option B: delta-ray production cut (MeV)")
-    p.add_argument("--kcut", type=float, default=0.1, help="option B: bremsstrahlung photon cut (MeV)")
+    p.add_argument("--kcut", type=float, default=0.1,
+                   help="option B: bremsstrahlung photon cut (MeV; the reference's is 0.00441638)")
+    p.add_argument("--k-track", type=float, default=0.1, help="option B: photons below are absorbed in place (MeV)")
     a = p.parse_args(argv)
     with open(a.config) as fh:
         cfg = yaml.safe_load(fh)
@@ -492,7 +494,7 @@ def main(argv=None) -> int:
     if a.model == "B":
         from dunefastsim.transport import cascade as cs
         b_cfg = cs.Config(n_cap=a.n_cap, m_cap=a.m_cap, fill=a.fill, s_max=a.s_max, fluctuate=not a.no_fluct,
-                          fluct_model=a.fluct)
+                          fluct_model=a.fluct, k_track=a.k_track)
     b_tab = None
     if a.model == "B" and (a.tcut, a.kcut) != (0.22, 0.1):
         from dunefastsim.transport import emphysics as em

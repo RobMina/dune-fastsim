@@ -180,3 +180,81 @@ def test_single_shower_is_batch_of_one(host):
     evs, _ = cs.split_events(cs.make_showers_fn(tb, cfg)(k, np.array([200.0]), np.zeros((1, 3)),
                                                          np.array([[0.0, 0, 1]])), 1)
     assert np.array_equal(a["de"], evs[0]["de"]) and np.array_equal(a["tid"], evs[0]["tid"])
+
+
+def test_photoelectric_argon():
+    """Livermore (EPICS2014) argon photoelectric cross section: NIST XCOM magnitudes, smooth at the joins, dominant
+    below ~60 keV and negligible against Compton at 1 MeV."""
+    per_cm2_g = em.N_A / em.A_AR * 1e-24  # barn per atom -> cm^2/g
+    s10 = float(em.photoelectric_xsec_per_atom_barn(0.010)) * per_cm2_g
+    s50 = float(em.photoelectric_xsec_per_atom_barn(0.050)) * per_cm2_g
+    assert 55.0 < s10 < 66.0 and 0.40 < s50 < 0.58, (s10, s50)  # XCOM: ~61 and ~0.48 cm2/g
+    for e in (em.PE_AR_LOW[0], em.PE_AR_HIGH[0]):
+        lo, hi = em.photoelectric_xsec_per_atom_barn(np.array([e * 0.999, e * 1.001]))
+        assert abs(hi / lo - 1) < 0.03, (e, lo, hi)
+
+
+def test_photon_tables_photoelectric(host):
+    k = host.k_nodes
+    i30, i1 = np.searchsorted(k, 0.03), np.searchsorted(k, 1.0)
+    assert host.sig_photo[i30] > host.sig_compton[i30]
+    assert host.sig_photo[i1] < 1e-2 * host.sig_compton[i1]  # argon at 1 MeV: ~0.1-0.3 %
+    assert k[0] <= em.KCUT_REFERENCE  # the tables reach the reference's photon cut
+
+
+def test_low_energy_photon_is_absorbed_with_its_energy(host):
+    """A 60 keV photon: deposited in full (photoelectric, or Compton and then photoelectric), centimetres away."""
+    tb = cs.device_tables(host)
+    cfg = cs.Config(n_cap=512, m_cap=1 << 14, k_track=0.004)  # tracked below the default 0.1 MeV cut
+    f = jax.jit(lambda k, e, v, d: cs.showers(tb, cfg, k, e, v, d, primary=cs.GAMMA))
+    nb = 200
+    out = f(jax.random.PRNGKey(5), np.full(nb, 0.06), np.zeros((nb, 3)), np.tile([0.0, 0.0, 1.0], (nb, 1)))
+    evs, _ = cs.split_events(out, nb)
+    z = []
+    for ev in evs:
+        assert np.isclose(ev["de"].sum(), 0.06, rtol=1e-8) and ev["lost_mev"] == 0.0
+        z.append(np.average(ev["positions_mm"][:, 2], weights=ev["de"]))
+    # mean free path at 60 keV: 1 / (photoelectric + Compton) ~ 1.5 cm in LAr; absorption takes longer
+    assert 5.0 < np.mean(z) < 60.0, np.mean(z)
+
+
+def _emsc_mixed_reference(T, s, n, positron, seed=3):
+    """hepsimkernels.emsc's own mixed scheme (NumPy): soft deflection with u_c from C1 lambda_1, then a Poisson number
+    of hard trials (sample_hard: Mott factor and nuclear form factor)."""
+    from hepsimkernels import emsc
+
+    mat = em.lar_material()
+    rng = np.random.default_rng(seed)
+    Ta = np.full(n, T)
+    uc = emsc.u_cut(mat, Ta, 0.22, positron)
+    d = np.tile([0.0, 0.0, 1.0], (n, 1))
+    d = emsc.deflect(rng, d, emsc.sample_soft(rng, mat, Ta, s, uc, 0.22, positron))
+    nh = rng.poisson(s * emsc.hard_xsec(mat, Ta, uc, 0.22, positron))
+    for j in range(int(nh.max())):
+        u, acc = emsc.sample_hard(rng, mat, Ta, uc, 0.22, positron)
+        m = (nh > j) & acc
+        d[m] = emsc.deflect(rng, d[m], u[m])
+    return np.arccos(np.clip(d[:, 2], -1.0, 1.0))
+
+
+@pytest.mark.parametrize("T,s", [(1.0, 0.4), (10.0, 5.0), (1000.0, 10.0)])
+def test_mixed_msc_matches_emsc_and_highland_core(host, T, s):
+    """Mixed scattering over one step against hepsimkernels.emsc's mixed sampler (median and 90 % angles; the mean
+    of this heavy-tailed angle is dominated by rare hard collisions) and against Highland's Gaussian core (median
+    near the Rayleigh median 1.177 theta0; the matched-mean Wentzel draw of v0.0.6 put it several times lower)."""
+    tb = cs.device_tables(host)
+    n = 200000
+    d0 = jnp.tile(jnp.array([0.0, 0.0, 1.0]), (n, 1))
+    for positron in (False, True):
+        out = cs._msc_mixed(tb, cs.Config(), jnp.full(n, positron), jnp.full(n, T), jnp.full(n, s), d0,
+                            jax.random.PRNGKey(11))
+        th = np.arccos(np.clip(np.asarray(out[:, 2]), -1.0, 1.0))
+        ref = _emsc_mixed_reference(T, s, n, positron)
+        for q, tol in ((0.5, 0.06), (0.9, 0.10)):
+            a, b = np.quantile(th, q), np.quantile(ref, q)
+            assert abs(a / b - 1) < tol, (positron, q, a, b)
+        pc = np.sqrt(T * (T + 2 * em.ME))
+        beta = pc / (T + em.ME)
+        xs = s / host.x0_mm
+        th0 = 13.6 / (beta * pc) * np.sqrt(xs) * (1 + 0.038 * np.log(xs / beta ** 2))
+        assert 0.7 < np.median(th) / (1.1774 * th0) < 1.3, (positron, np.median(th), th0)

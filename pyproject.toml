@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dunefastsim"
-version = "0.0.5"
+version = "0.0.7"
 description = "JAX fast simulation of the DUNE Near Detector (ND-LAr charge and light) for light-dark-matter studies"
 license = "Apache-2.0"
 requires-python = ">=3.11,<3.14"  # lumen 0.2 and jax 0.6.2: Python <=3.13

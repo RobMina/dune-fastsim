@@ -36,6 +36,45 @@ Z_AR, A_AR = 18, 39.948
 RHO_LAR = 1.396
 I_LAR_EV = 188.0
 STERNHEIMER_LAR = (5.2146, 0.2, 3.0, 0.19559, 3.0, 0.0)
+
+# Photoelectric effect in argon as Geant4's option-0 physics computes it (G4LivermorePhotoElectricModel, Geant4 11.4.0,
+# ComputeCrossSectionPerAtom), from G4EMLOW 8.8 livermore/phot_epics2014 (EPICS2014) for Z = 18: the last-shell rows
+# of pe-high-18.dat and pe-low-18.dat (sigma = sum_i a_i / E^(i+1), barn and MeV, above 59.5662 keV and above
+# 6.30957 keV) and pe-cs-18.dat (sigma E^3 in barn MeV^3 from the K edge to 6.6 keV; Geant4 splines it, linear here
+# on its 28 nodes). Geant4 clamps the energy below at the last shell's binding energy (14.43 eV).
+PE_AR_HIGH = (0.0595662, (0.00176596, 0.00233442, 0.00115495, 0.00047547, -3.32075e-05, 8.61093e-07))
+PE_AR_LOW = (0.00630957, (1.19022, -0.155437, 0.0105813, -0.000100674, 6.7825e-07, -1.75352e-09))
+PE_AR_EMIN = 1.443e-05
+PE_AR_KEDGE = 0.0031776
+PE_AR_SIGMA_E3 = np.array([
+    (0.0031776, 0.00280166),
+    (0.00331131, 0.00292244),
+    (0.00334965, 0.00295718),
+    (0.00335, 0.00295749),
+    (0.00338844, 0.00297437),
+    (0.00358922, 0.00306119),
+    (0.0036, 0.00306578),
+    (0.0036789, 0.00309253),
+    (0.00380189, 0.00313332),
+    (0.00384592, 0.00314775),
+    (0.00389045, 0.00316221),
+    (0.00416869, 0.00325059),
+    (0.0042658, 0.00328061),
+    (0.00436516, 0.00331073),
+    (0.00446684, 0.00334116),
+    (0.00467735, 0.00340282),
+    (0.00484172, 0.00344782),
+    (0.0049545, 0.00347814),
+    (0.00506991, 0.00350852),
+    (0.00512861, 0.00352103),
+    (0.005188, 0.00353358),
+    (0.00562341, 0.00362276),
+    (0.0057544, 0.00364868),
+    (0.00588844, 0.00367457),
+    (0.00595662, 0.0036876),
+    (0.0060256, 0.00370068),
+    (0.00630957, 0.00375344),
+    (0.00660693, 0.0037962)])
 N_ATOM_MM3 = RHO_LAR * N_A / A_AR * 1e-3  # atoms per mm^3
 N_E_MM3 = Z_AR * N_ATOM_MM3
 
@@ -108,6 +147,19 @@ def tsai_dedx_restricted(t, kcut):
 
 
 # ------------------------------------------------------------------------------------------------------- Compton
+def photoelectric_xsec_per_atom_barn(k):
+    """Photoelectric cross section of argon [barn per atom] at photon energy k [MeV] (G4LivermorePhotoElectricModel,
+    EPICS2014). Above the K edge only: below it (3.18 keV) photons are absorbed where they are anyway."""
+    k = np.maximum(np.asarray(k, float), PE_AR_EMIN)
+    x1 = 1.0 / k
+
+    def par(c):
+        return x1 * (c[0] + x1 * (c[1] + x1 * (c[2] + x1 * (c[3] + x1 * (c[4] + x1 * c[5])))))
+
+    tab = x1 ** 3 * np.interp(k, PE_AR_SIGMA_E3[:, 0], PE_AR_SIGMA_E3[:, 1])
+    return np.where(k >= PE_AR_HIGH[0], par(PE_AR_HIGH[1]), np.where(k >= PE_AR_LOW[0], par(PE_AR_LOW[1]), tab))
+
+
 def klein_nishina_xsec_per_electron(k):
     """Total Klein-Nishina cross section per free electron [mm^2]."""
     x = np.asarray(k, float) / ME
@@ -174,6 +226,12 @@ class HostTables:
     brem_q: np.ndarray  # (2, NT, NC) x = ln(k/kcut)/ln(T/kcut) at CDF nodes
     delta_q: np.ndarray  # (2, NT, NC) x = ln(w/tcut)/ln(wmax/tcut) at CDF nodes
     lam1: np.ndarray  # (2, NT) first transport mean free path [mm] (hepsimkernels.emsc, Mott-corrected)
+    msc_k: np.ndarray  # (2, NT) screened-Rutherford prefactor n K Z / (beta^2 p^2) [1/mm] (emsc._parts)
+    msc_s: np.ndarray  # (2, NT) screening s in u = 1 - cos theta
+    msc_ue: np.ndarray  # (2, NT) largest u of scattering on atomic electrons (transfers above tcut are deltas)
+    msc_env: np.ndarray  # (2, NT) upper bound of the Mott factor (1 for e+)
+    mott_coef: np.ndarray  # (5, 6) G4ScreeningMottCrossSection fit for Z = 18 (e- Mott / Rutherford)
+    msc_ffa: float  # nuclear form factor constant f_A = 6.937e-6 A^0.54 [MeV^-2] (hard collisions above 100 MeV)
     wentzel_lnq: np.ndarray  # (NQ,) ln <1 - cos> nodes of the Wentzel screening table
     wentzel_lna: np.ndarray  # (NQ,) ln A with <1 - cos>_Wentzel(A) = q
     lnk0: float
@@ -181,6 +239,7 @@ class HostTables:
     k_nodes: np.ndarray  # (NK,)
     sig_compton: np.ndarray  # (NK,) [1/mm]
     sig_pair: np.ndarray  # (NK,) [1/mm]
+    sig_photo: np.ndarray  # (NK,) photoelectric [1/mm]
     compton_q: np.ndarray  # (NK, NC) eps = k'/k
     pair_q: np.ndarray  # (NK, NC) electron total-energy fraction
     tcut: float
@@ -224,13 +283,21 @@ def wentzel_table(nq=601, qmin=1e-10, qmax=0.999):
     return np.log(q), 0.5 * (lo + hi)
 
 
-def build_tables(tcut=0.22, kcut=0.1, t_min=0.05, t_max=1e5, nt=241, k_min=0.05, nk=241, nc=129, nx=129):
+KCUT_REFERENCE = 0.00441638  # MeV: the reference's gamma production threshold in LAr (500 um range cut, its log)
+
+
+def build_tables(tcut=0.22, kcut=0.1, t_min=0.05, t_max=1e5, nt=241, k_min=0.002, nk=281, nc=129,
+                 nx=129):
     """Tables for liquid argon with delta production cut ``tcut`` and photon cut ``kcut`` (MeV).
 
-    tcut 0.22 MeV is the delta-ray threshold of the Geant4 reference (DUNE ND production edep-sim settings: its
-    lowest delta rays from e+- are 0.22 MeV); it sets where the fluctuated restricted loss ends, so it matters for the
-    dE/dx spread (0.35 MeV gave a 10-20 % wider fixed-length spread). That reference's photon threshold is about
-    10 keV; kcut stays at 0.1 MeV (photons below it barely move the deposits and cost many lanes)."""
+    The Geant4 reference (DUNE ND production edep-sim settings, 500 um range cut) prints its LAr thresholds: e- 220.878
+    keV, e+ 215.258 keV, gamma 4.41638 keV. tcut 0.22 MeV sets where the fluctuated restricted loss ends, so it
+    matters for the dE/dx spread (0.35 MeV gave a 10-20 % wider fixed-length spread). kcut sets which bremsstrahlung
+    photons fly instead of depositing along the track. It stays at 0.1 MeV: the reference's 4.42 keV
+    (``KCUT_REFERENCE``, with photons tracked down to 4 keV, ``Config.k_track``) left deposited fraction, depth and
+    radial containment unchanged against Geant4 (1 GeV electrons, 2026-11-22) and cost 30 % more time. Photon tables
+    run from k_min (2 keV) with Klein-Nishina Compton, Bethe-Heitler pair and the Livermore photoelectric effect (no
+    Rayleigh scattering), so a lower kcut / k_track is a setting away."""
     from hepsimkernels import ebrem, eioni, emsc
 
     mat = lar_material()
@@ -288,6 +355,15 @@ def build_tables(tcut=0.22, kcut=0.1, t_min=0.05, t_max=1e5, nt=241, k_min=0.05,
 
     lam1 = np.stack([1.0 / np.maximum(emsc.transport_xsec(mat, t_nodes, 2.0, tcut, positron=pos), 1e-300)
                      for pos in (False, True)])
+    # mixed multiple scattering (v0.0.7): screened-Rutherford pieces of hepsimkernels.emsc per species and energy
+    # (one element: argon), so the device can split soft and hard collisions at any boundary u_c
+    msc_k, msc_s, msc_ue, msc_env = (np.zeros((2, nt)) for _ in range(4))
+    for ip, pos in enumerate((False, True)):
+        z_, a_, s_, k_, ue_ = emsc._parts(mat, t_nodes, tcut, pos)
+        msc_k[ip], msc_s[ip], msc_ue[ip] = k_[0], s_[0], ue_
+        msc_env[ip] = emsc.mott_envelope(z_, t_nodes, pos)[0]
+    msc_ffa = float(emsc.FORM_FACTOR * float(emsc.elements(mat)[2][0]) ** 0.54)
+    mott_coef = np.asarray(emsc.mott_coefficients()[Z_AR], float)
     w_lnq, w_lna = wentzel_table()
     # restricted CSDA range: R(T) = integral of dT / dedx from 0 (a 1/dedx extrapolation below t_min)
     rng = np.zeros((2, nt))
@@ -300,6 +376,7 @@ def build_tables(tcut=0.22, kcut=0.1, t_min=0.05, t_max=1e5, nt=241, k_min=0.05,
     lnk0, dlnk = np.log(k_min), np.log(t_max / k_min) / (nk - 1)
     sig_c = N_E_MM3 * klein_nishina_xsec_per_electron(k_nodes)
     sig_p = pair_xsec_per_mm(k_nodes)
+    sig_ph = N_ATOM_MM3 * 1e-22 * photoelectric_xsec_per_atom_barn(k_nodes)  # barn = 1e-22 mm^2
     compton_q = np.zeros((nk, nc))
     pair_q = np.zeros((nk, nc))
     for i, k in enumerate(k_nodes):
@@ -313,5 +390,6 @@ def build_tables(tcut=0.22, kcut=0.1, t_min=0.05, t_max=1e5, nt=241, k_min=0.05,
         else:
             pair_q[i] = 0.5
     x0_mm = radiation_length_g_cm2() / RHO_LAR * 10.0
-    return HostTables(lnt0, dlnt, t_nodes, dedx, rng, sig_b, sig_d, brem_q, delta_q, lam1, w_lnq, w_lna, lnk0, dlnk,
-                      k_nodes, sig_c, sig_p, compton_q, pair_q, float(tcut), float(kcut), float(x0_mm))
+    return HostTables(lnt0, dlnt, t_nodes, dedx, rng, sig_b, sig_d, brem_q, delta_q, lam1, msc_k, msc_s, msc_ue,
+                      msc_env, mott_coef, msc_ffa, w_lnq, w_lna, lnk0, dlnk,
+                      k_nodes, sig_c, sig_p, sig_ph, compton_q, pair_q, float(tcut), float(kcut), float(x0_mm))

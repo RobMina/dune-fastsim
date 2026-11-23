@@ -19,7 +19,7 @@ This package **depends on** those projects and vendors none of them. What it add
 Public material only: no collaboration-internal geometry, configuration or results. Site paths come from
 `site.env` (see `site.env.example`), never from the code.
 
-## Status (v0.0.5)
+## Status (v0.0.7)
 
 | Piece | State |
 |---|---|
@@ -29,7 +29,7 @@ Public material only: no collaboration-internal geometry, configuration or resul
 | `steps.validate`, `dunefastsim steps-validate` | energy sums and containment of steps in a JAXTPC config's drift volumes |
 | `transport.parametric` (option A) | GFLASH parametric showers in liquid argon plus a leading track, a fluctuation ramp, a dE/dx spread and a photon conversion delay; differentiable, f32/f64; compared with Geant4 (below) |
 | `transport.compare` | option A or B against a Geant4 reference in the step format: deposited fraction, longitudinal and radial profiles, dE/dx, dE/dx over fixed lengths (3.72 mm pixel pitch, 10 mm), per energy bin |
-| `transport.emphysics` + `transport.cascade` (option B) | condensed-history electron/photon cascade in JAX: e± physics from [hep-simkernels](https://github.com/RobMina/hep-simkernels) up to 1 GeV (Moller/Bhabha, Seltzer-Berger, Mott-corrected transport cross section, Urban fluctuations; Geant4's option-0 G4UniversalFluctuation from v0.0.5), Tsai bremsstrahlung above, Klein-Nishina Compton, Bethe-Heitler pair; Wentzel multiple scattering with lateral displacement, modified-Tsai emission angles; fixed-capacity particle and deposit buffers with overflow accounting; energy conserved per shower; many showers share one buffer (new primaries enter as lanes free up); extra `[transport]` |
+| `transport.emphysics` + `transport.cascade` (option B) | condensed-history electron/photon cascade in JAX: e± physics from [hep-simkernels](https://github.com/RobMina/hep-simkernels) up to 1 GeV (Moller/Bhabha, Seltzer-Berger, Mott-corrected transport cross section, Urban fluctuations; Geant4's option-0 G4UniversalFluctuation from v0.0.5), Tsai bremsstrahlung above, Klein-Nishina Compton, Bethe-Heitler pair, photoelectric effect (Livermore EPICS2014, v0.0.6); mixed multiple scattering (soft Gaussian-like plus hard screened-Rutherford collisions with the Mott factor, v0.0.7) with lateral displacement, modified-Tsai emission angles; fixed-capacity particle and deposit buffers with overflow accounting; energy conserved per shower; many showers share one buffer (new primaries enter as lanes free up); extra `[transport]` |
 | `geometry` JAXTPC volumes from the GDML | done; on DUNE's hall GDML v2026.03.06 every Geant4 step in the active argon lands in exactly one generated drift volume |
 | `charge` (JAXTPC) | status check only; no simulation run yet |
 | `light` (lumen 0.2 + lumen-tpc `dune_ndlar`) | status check only |
@@ -48,14 +48,15 @@ About 4 ms per shower in float32 on 4 CPU cores.
 ### Option B against Geant4
 
 Full samples (2000 electrons each, 34 MeV to 22 GeV; one from pi0 decays, one from eta decays), same drift volumes,
-float64, v0.0.5 defaults: longest e± step 10 mm, Geant4's option-0 fluctuation model, delta rays from 0.22 MeV (all
-three as in the Geant4 reference).
+float64, v0.0.7 defaults: longest e± step 10 mm, Geant4's option-0 fluctuation model, delta rays from 0.22 MeV (all
+three as in the Geant4 reference), mixed multiple scattering.
 
 | | pi0 sample, Geant4 | pi0 sample, option B | eta sample, Geant4 | eta sample, option B |
 |---|---|---|---|---|
-| deposited fraction | 0.740 | 0.750 | 0.714 | 0.720 |
-| mean depth (X0) | 4.79 | 4.79 | 5.97 | 5.95 |
-| within 1 Moliere radius | 0.865 | 0.877 | 0.867 | 0.877 |
+| deposited fraction | 0.740 | 0.753 | 0.714 | 0.721 |
+| mean depth (X0) | 4.79 | 4.73 | 5.97 | 5.88 |
+| within 1 Moliere radius | 0.865 | 0.867 | 0.867 | 0.868 |
+| within 2 Moliere radii | 0.948 | 0.950 | 0.949 | 0.951 |
 
 dE/dx summed over fixed lengths of e± track (pi0 sample; eta sample the same within 0.01 MeV/cm), in MeV/cm:
 
@@ -82,11 +83,27 @@ and shortens option B's showers by a further 0.08 X0 (mean depth 4.26 vs 4.45 X0
 mid-module). Smaller than option B's other residuals (deposited fraction 0.6-1 point high and 1 Moliere radius
 containment 1 point high at every energy); 2 mm steps do no better at the wall.
 
+**Multiple scattering (v0.0.7).** Up to v0.0.6 each step drew one screened-Rutherford (Wentzel) deflection with its
+mean matched to the transport mean free path: right tail, but in the many-collision regime a typical angle several
+times below the Gaussian core, so showers came out 1-1.5 points too contained within 1 Moliere radius (outside the
+0.3-point spread between Geant4's EM options 0, 3 and 4). Option B now uses the mixed scheme of hepsimkernels.emsc:
+collisions below a boundary angle summed into one Gaussian-like deflection, plus a Poisson number of hard
+screened-Rutherford collisions above it (Mott factor, nuclear form factor above 100 MeV), at most 2 expected and 6
+sampled per step. Per-step angles agree with hepsimkernels' own sampler within 6 % (median) and 10 % (90 %) from 1 MeV
+to 1 GeV; containment within 1 Moliere radius now agrees within 0.2 points.
+
+**Remaining gaps.** Deposited fraction is 0.7-1.4 points high and mean depth 0.06-0.09 X0 short. Positrons deposit
+about 1 point more of the energy than in Geant4 (option B has no annihilation in flight), and 5 % less pair production
+would match the depth; neither is fixed yet. Option B has the photoelectric effect (Geant4's option-0 Livermore
+model, EPICS2014 data for argon) from v0.0.6; lowering its photon cut from 0.1 MeV to the reference's 4.4 keV
+(`--kcut 0.00441638 --k-track 0.004`) changes none of these, so the default stays 0.1 MeV (30 % faster).
+
 Speed, 64 showers per call in one buffer, no energy lost to buffer overflow:
 
 | | pi0 sample | eta sample (higher energies) |
 |---|---|---|
-| 4 CPU cores, float64, 10 mm steps (16384 lanes) | 0.11 s per shower | 0.34 s |
+| 4 CPU cores, float64, 10 mm steps, mixed scattering (v0.0.7) | 0.18 s per shower | 0.56 s |
+| 4 CPU cores, float64, 10 mm steps, Wentzel scattering (v0.0.5) | 0.11 s | 0.34 s |
 | 4 CPU cores, float64, 2 mm steps (8192 lanes, v0.0.4) | 0.37 s | 1.27 s |
 | one RTX A6000, float32, 2 mm steps (v0.0.4) | 17 ms | 61 ms |
 

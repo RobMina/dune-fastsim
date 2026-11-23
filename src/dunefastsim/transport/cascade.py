@@ -19,12 +19,14 @@ Physics per step (tables from ``emphysics``; production cuts tcut for deltas and
   Discrete interactions at the post-step energy: bremsstrahlung above kcut (photon angle from Geant4's modified
   Tsai distribution, B1) or a delta ray above tcut (two-body kinematics). Below the tracking cut ``t_track`` the remaining kinetic energy is
   deposited; a positron then annihilates at rest into two 511 keV photons, back to back, isotropic.
-- photons: fly to the next Compton or pair interaction (no deposits). Compton: Klein-Nishina energy and angle, the
+- photons: fly to the next Compton, pair or photoelectric interaction. Photoelectric (v0.0.6, Livermore EPICS2014 as
+  Geant4's option 0, fluorescence off): the photon's whole energy is deposited where it is absorbed (the
+  photoelectron's range is below 0.1 mm). Compton: Klein-Nishina energy and angle, the
   electron from momentum conservation. Pair: electron/positron energies from Bethe-Heitler, each lepton at a modified-Tsai angle,
   opposite azimuths (B1).
-  Photons below ``k_track`` are absorbed where they are (photoelectric, local deposit).
+  Photons below ``k_track`` are absorbed where they are (their photoelectric mean free path is microns).
 
-Not yet: the mixed (class II) scattering scheme itself, annihilation in flight, photoelectric cross section above ``k_track``, Rayleigh scattering, boundaries (infinite
+Not yet: the mixed (class II) scattering scheme itself, annihilation in flight, Rayleigh scattering, boundaries (infinite
 argon; the geometry cut is applied downstream as for option A).
 
 Many primaries per call (B2, ``showers``): the particle buffer is shared; waiting primaries enter the free lanes
@@ -60,12 +62,19 @@ class Tables(NamedTuple):
     brem_q: jax.Array
     delta_q: jax.Array
     lam1: jax.Array
+    msc_k: jax.Array
+    msc_s: jax.Array
+    msc_ue: jax.Array
+    msc_env: jax.Array
+    mott_coef: jax.Array
+    msc_ffa: jax.Array
     wentzel_lnq: jax.Array
     wentzel_lna: jax.Array
     lnk0: jax.Array
     dlnk: jax.Array
     sig_compton: jax.Array
     sig_pair: jax.Array
+    sig_photo: jax.Array
     compton_q: jax.Array
     pair_q: jax.Array
     tcut: jax.Array
@@ -83,8 +92,9 @@ def device_tables(h: HostTables, dtype=jnp.float64) -> Tables:
     mc = eloss_jax.consts(lar_material())
     mc = type(mc)(*(f(v) for v in mc))
     return Tables(f(h.lnt0), f(h.dlnt), f(h.t_nodes), f(h.dedx), f(h.rng), f(h.sig_brem), f(h.sig_delta),
-                  f(h.brem_q), f(h.delta_q), f(h.lam1), f(h.wentzel_lnq), f(h.wentzel_lna), f(h.lnk0), f(h.dlnk),
-                  f(h.sig_compton), f(h.sig_pair), f(h.compton_q), f(h.pair_q), f(h.tcut), f(h.kcut), f(h.x0_mm), mc)
+                  f(h.brem_q), f(h.delta_q), f(h.lam1), f(h.msc_k), f(h.msc_s), f(h.msc_ue),
+                  f(h.msc_env), f(h.mott_coef), f(h.msc_ffa), f(h.wentzel_lnq), f(h.wentzel_lna), f(h.lnk0), f(h.dlnk),
+                  f(h.sig_compton), f(h.sig_pair), f(h.sig_photo), f(h.compton_q), f(h.pair_q), f(h.tcut), f(h.kcut), f(h.x0_mm), mc)
 
 
 class Config(NamedTuple):
@@ -92,7 +102,7 @@ class Config(NamedTuple):
     m_cap: int = 1 << 18
     max_iter: int = 20000
     t_track: float = 0.1  # MeV, e+- tracking cut
-    k_track: float = 0.1  # MeV, photon tracking cut (photoelectric: local absorption)
+    k_track: float = 0.1  # MeV, photons below are absorbed where they are (0.004 with kcut = KCUT_REFERENCE)
     f_range: float = 0.2  # step <= f_range * residual range ...
     s_min: float = 0.1  # ... but at least s_min (mm) ...
     s_max: float = 10.0  # ... and at most s_max (mm). Decision 7 (user, 2026-11-22): 10 mm, close to Geant4's own
@@ -100,7 +110,10 @@ class Config(NamedTuple):
     # 2 mm resolves finer loss fluctuations, 20 mm matches Geant4 exactly but steps across volume boundaries
     fluctuate: bool = True  # loss fluctuations (B1)
     fluct_model: str = "universal"  # "universal" (G4UniversalFluctuation, EM option 0) or "urban" (options 3/4)
-    msc: str = "wentzel"  # "wentzel" (B1) or "highland" (B0)
+    msc: str = "mixed"  # "mixed" (v0.0.7), "wentzel" (B1), "highland" (B0), "gauss" (diagnostic)
+    msc_c1: float = 0.05  # mixed: hard collisions every msc_c1 * lambda_1 (hepsimkernels.emsc.C1) ...
+    msc_mu_max: float = 2.0  # ... but at most msc_mu_max of them expected per step ...
+    msc_k_hard: int = 6  # ... and at most msc_k_hard sampled (P(more) < 0.5 % at mu = 2)
     tsai_angles: bool = True  # brem / pair angles (B1); False: collinear (B0)
     fill: float = 0.25  # B2: new primaries enter only while fewer than fill * n_cap particles are alive
 
@@ -168,6 +181,92 @@ def _rotate(d, cost, phi):
     return out / jnp.linalg.norm(out, axis=1, keepdims=True)
 
 
+def _rotate_u(d, u, phi):
+    """_rotate by u = 1 - cos(theta), with sin(theta) from u (keeps tiny angles in float32)."""
+    u = jnp.clip(u, 0.0, 2.0)
+    sint = jnp.sqrt(u * (2.0 - u))
+    helper = jnp.where(jnp.abs(d[:, 2:3]) < 0.9, jnp.array([0.0, 0.0, 1.0], d.dtype), jnp.array([1.0, 0.0, 0.0], d.dtype))
+    e1 = jnp.cross(d, helper)
+    e1 = e1 / jnp.linalg.norm(e1, axis=1, keepdims=True)
+    e2 = jnp.cross(d, e1)
+    out = (1.0 - u)[:, None] * d + sint[:, None] * (jnp.cos(phi)[:, None] * e1 + jnp.sin(phi)[:, None] * e2)
+    return out / jnp.linalg.norm(out, axis=1, keepdims=True)
+
+
+def _g_screen(x):
+    """int_0^x v / (1 + v)^2 dv = ln(1 + x) - x / (1 + x), with its series below 1e-3."""
+    xs = jnp.where(x < 1e-3, x, 0.0)
+    xl = jnp.where(x < 1e-3, 1.0, x)
+    return jnp.where(x < 1e-3, xs * xs * (0.5 - xs * (2.0 / 3.0 - 0.75 * xs)), jnp.log1p(xl) - xl / (1.0 + xl))
+
+
+def _msc_mixed(tb, cfg, pos, Tm, s, d, key):
+    """Mixed (class II) multiple scattering over a step of length s at mean energy Tm (hepsimkernels.emsc scheme).
+
+    Collisions with u = 1 - cos(theta) below a boundary u_c are soft: summed into one deflection, u exponential with
+    mean 1 - exp(-s Sigma_1,soft) (a two-dimensional Gaussian in angle at small angles). Collisions above u_c are hard:
+    a Poisson number of screened-Rutherford trials (nuclei up to u = 2, atomic electrons up to u_e), each accepted
+    with the Mott factor (e-: G4ScreeningMottCrossSection fit; e+: McKinley-Feshbach) times the nuclear form factor
+    above 100 MeV over its envelope. u_c puts hard collisions every C1 lambda_1, but at most mu_max per step on
+    average; at most k_hard are sampled. Returns the new direction."""
+    dt = d.dtype
+    lnt = jnp.log(jnp.maximum(Tm, 1e-6))
+    k = jnp.exp(_e_tab(jnp.log(jnp.maximum(tb.msc_k, 1e-300)), pos, lnt, tb.lnt0, tb.dlnt))
+    scr = jnp.exp(_e_tab(jnp.log(jnp.maximum(tb.msc_s, 1e-300)), pos, lnt, tb.lnt0, tb.dlnt))
+    ue = jnp.clip(_e_tab(tb.msc_ue, pos, lnt, tb.lnt0, tb.dlnt), 0.0, 2.0)
+    env = jnp.maximum(_e_tab(tb.msc_env, pos, lnt, tb.lnt0, tb.dlnt), 1e-6)
+    lam = jnp.exp(_e_tab(jnp.log(tb.lam1), pos, lnt, tb.lnt0, tb.dlnt))
+    zz = 18.0
+    s = jnp.maximum(s, 1e-12)
+    # boundary: Rutherford rate of collisions above u_c = min(Sigma_1 / C1, mu_max / s)
+    rate = jnp.minimum(1.0 / (cfg.msc_c1 * lam), cfg.msc_mu_max / s)
+    inv_a = (rate / k + zz / (2.0 + scr) + 1.0 / (ue + scr)) / (zz + 1.0)  # u_c < u_e: nuclei and electrons
+    uc_a = 1.0 / inv_a - scr
+    uc_b = 1.0 / (rate / (k * zz) + 1.0 / (2.0 + scr)) - scr  # u_c >= u_e: nuclei only
+    uc = jnp.clip(jnp.where(uc_a < ue, uc_a, uc_b), 1e-14, 2.0)
+    # soft: Sigma_1 of collisions below u_c (screened Rutherford), one exponential u
+    sig1s = k * (zz * _g_screen(uc / scr) + _g_screen(jnp.minimum(uc, ue) / scr))
+    m1 = -jnp.expm1(-s * sig1s)
+    ks = jax.random.split(key, 3)
+    us = jax.random.uniform(ks[0], s.shape, dt, minval=1e-30, maxval=1.0)
+    u_soft = jnp.minimum(-m1 * jnp.log(us), 2.0)
+    d = _rotate_u(d, u_soft, 2.0 * jnp.pi * jax.random.uniform(ks[1], s.shape, dt))
+    # hard: envelope rates on nuclei and electrons above u_c
+    r_nuc = k * zz * (1.0 / (uc + scr) - 1.0 / (2.0 + scr))
+    r_ele = jnp.where(ue > uc, k * (1.0 / (uc + scr) - 1.0 / (ue + scr)), 0.0)
+    mu = s * env * (r_nuc + r_ele)
+    p_nuc = r_nuc / jnp.maximum(r_nuc + r_ele, 1e-300)
+    uh = jax.random.uniform(ks[2], (cfg.msc_k_hard, 5) + s.shape, dt, minval=1e-30, maxval=1.0)
+    # number of trials: inverse-CDF Poisson, capped at k_hard
+    pmf = jnp.exp(-mu)
+    cdf = pmf
+    nh = jnp.zeros(s.shape, jnp.int32)
+    for j in range(cfg.msc_k_hard):
+        nh = nh + (uh[j, 0] > cdf)
+        pmf = pmf * mu / (j + 1)
+        cdf = cdf + pmf
+    p2 = Tm * (Tm + 2 * ME)
+    b2 = p2 / (Tm + ME) ** 2
+    beta = jnp.sqrt(b2)
+    b0 = beta - 0.7181228
+    bk = jnp.stack([b0 ** i for i in range(6)], axis=-1)  # (lanes, 6)
+    aj = bk @ tb.mott_coef.T  # (lanes, 5)
+    alpha = 1.0 / 137.035999
+    for j in range(cfg.msc_k_hard):
+        on_nuc = uh[j, 1] < p_nuc
+        umax = jnp.where(on_nuc, 2.0, jnp.maximum(ue, uc))
+        w1, w2 = 1.0 / (uc + scr), 1.0 / (umax + scr)
+        u = jnp.clip(1.0 / (w1 - uh[j, 2] * (w1 - w2)) - scr, uc, umax)
+        su = jnp.sqrt(u)
+        r_em = jnp.maximum(aj[:, 0] + su * (aj[:, 1] + su * (aj[:, 2] + su * (aj[:, 3] + su * aj[:, 4]))), 0.0)
+        r_ep = 1.0 - 0.5 * b2 * u - 0.5 * jnp.pi * alpha * zz * jnp.sqrt(0.5 * b2 * u) * (2.0 - u)
+        ff = jnp.where(on_nuc & (Tm > 100.0), 1.0 / (1.0 + tb.msc_ffa * p2 * u) ** 2, 1.0)
+        acc = uh[j, 3] * env <= jnp.where(pos, r_ep, r_em) * ff
+        hit = (j < nh) & acc
+        d = jnp.where(hit[:, None], _rotate_u(d, u, 2.0 * jnp.pi * uh[j, 4]), d)
+    return d
+
+
 def _tsai_cos(T, r1, r2, r3):
     """Geant4's modified Tsai polar angle for a lepton of kinetic energy T (G4ModifiedTsai::SampleCosTheta): u =
     -ln(r1 r2) a, a = 1.6 with probability 0.25 else 1.6/3, capped at u_max = 2 (1 + T/m); cos = 1 - 2 u^2/u_max^2."""
@@ -217,7 +316,7 @@ def _icum(b):
 def _step(tb: Tables, cfg: Config, st: State) -> State:
     dt = st.T.dtype
     n = cfg.n_cap
-    key, ku, kn, kf1, kf2 = jax.random.split(st.key, 5)
+    key, ku, kn, kf1, kf2, km = jax.random.split(st.key, 6)
     u = jax.random.uniform(ku, (n, 18), dt, minval=1e-12, maxval=1.0)
     z = jax.random.normal(kn, (n, 2), dt)
     kind, T, x, d = st.kind, st.T, st.x, st.d
@@ -286,13 +385,20 @@ def _step(tb: Tables, cfg: Config, st: State) -> State:
     Tm = 0.5 * (T + T_post)
     pc = jnp.sqrt(jnp.maximum(Tm * (Tm + 2 * ME), 1e-12))
     beta = pc / (Tm + ME)
-    if cfg.msc == "wentzel":
+    if cfg.msc == "mixed":
+        d_msc = _msc_mixed(tb, cfg, pos, Tm, s, d, km)
+    elif cfg.msc == "wentzel":
         lam = jnp.exp(_e_tab(jnp.log(tb.lam1), pos, jnp.log(jnp.maximum(Tm, 1e-6)), tb.lnt0, tb.dlnt))
         q = -jnp.expm1(-jnp.maximum(s, 1e-12) / lam)
         lnq = jnp.log(jnp.clip(q, 1e-10, 0.999))
         a_scr = jnp.exp(jnp.interp(lnq, tb.wentzel_lnq, tb.wentzel_lna))
         uw = u[:, 10]
         one_minus = jnp.clip(2.0 * a_scr * uw / (1.0 - uw + a_scr), 0.0, 2.0)
+        d_msc = _rotate(d, 1.0 - one_minus, 2.0 * jnp.pi * u[:, 11])
+    elif cfg.msc == "gauss":  # diagnostic: all-soft, u exponential (2D Gaussian in angle) with the same mean as wentzel
+        lam = jnp.exp(_e_tab(jnp.log(tb.lam1), pos, jnp.log(jnp.maximum(Tm, 1e-6)), tb.lnt0, tb.dlnt))
+        q = -jnp.expm1(-jnp.maximum(s, 1e-12) / lam)
+        one_minus = jnp.clip(-q * jnp.log(jnp.maximum(u[:, 10], 1e-30)), 0.0, 2.0)
         d_msc = _rotate(d, 1.0 - one_minus, 2.0 * jnp.pi * u[:, 11])
     else:
         xs = jnp.maximum(s, 1e-9) / tb.x0_mm
@@ -316,12 +422,15 @@ def _step(tb: Tables, cfg: Config, st: State) -> State:
     lnk = jnp.log(Tsafe)
     sc = _lin(tb.sig_compton, tb.lnk0, tb.dlnk, lnk)
     sp = _lin(tb.sig_pair, tb.lnk0, tb.dlnk, lnk)
+    sph = jnp.maximum(_lin(tb.sig_photo, tb.lnk0, tb.dlnk, lnk), 0.0)
+    sig_g = jnp.maximum(sc + sp + sph, 1e-30)
     absorb = gamma & (T < cfg.k_track)
-    s_g = -jnp.log(u[:, 4]) / jnp.maximum(sc + sp, 1e-30)
+    s_g = -jnp.log(u[:, 4]) / sig_g
     s_g = jnp.where(absorb, 0.0, s_g)
     x_g = x + d * s_g[:, None]
-    is_pair = gamma & ~absorb & (u[:, 5] < sp / jnp.maximum(sc + sp, 1e-30)) & (T > 2 * ME)
-    is_comp = gamma & ~absorb & ~is_pair
+    is_pair = gamma & ~absorb & (u[:, 5] < sp / sig_g) & (T > 2 * ME)
+    is_photo = gamma & ~absorb & ~is_pair & (u[:, 5] < (sp + sph) / sig_g)
+    is_comp = gamma & ~absorb & ~is_pair & ~is_photo
     eps_c = _lin2(tb.compton_q, tb.lnk0, tb.dlnk, lnk, u[:, 6])
     k_out = eps_c * T
     T_ce = T - k_out
@@ -337,10 +446,10 @@ def _step(tb: Tables, cfg: Config, st: State) -> State:
     t_after_g = st.t + s_g / C_MM_NS
 
     # ------------------------------------------------------------------ deposits (at most one per lane)
-    g_de = jnp.where(absorb, T, 0.0)
+    g_de = jnp.where(absorb | is_photo, T, 0.0)
     de = jnp.where(charged, c_de, g_de)
     has_dep = alive & (de > 0)
-    dpos = jnp.where(charged[:, None], c_mid, x)
+    dpos = jnp.where(charged[:, None], c_mid, jnp.where(is_photo[:, None], x_g, x))
     cn = jnp.linalg.norm(chord, axis=1, keepdims=True)
     ddir = jnp.where(charged[:, None] & (cn > 1e-12), chord / jnp.maximum(cn, 1e-12), d)  # the step chord
     ddx = jnp.where(charged, jnp.maximum(s, 1e-6), 1e-3)
@@ -352,7 +461,7 @@ def _step(tb: Tables, cfg: Config, st: State) -> State:
     dep = dep._replace(
         pos=dep.pos.at[idx].set(dpos, mode="drop"), de=dep.de.at[idx].set(de, mode="drop"),
         dx=dep.dx.at[idx].set(ddx, mode="drop"), dirn=dep.dirn.at[idx].set(ddir, mode="drop"),
-        t=dep.t.at[idx].set(st.t, mode="drop"), tid=dep.tid.at[idx].set(st.tid, mode="drop"),
+        t=dep.t.at[idx].set(jnp.where(is_photo, t_after_g, st.t), mode="drop"), tid=dep.tid.at[idx].set(st.tid, mode="drop"),
         anc=dep.anc.at[idx].set(st.sid, mode="drop"), pdg=dep.pdg.at[idx].set(dpdg, mode="drop"),
         n=jnp.minimum(dep.n + _isum(has_dep), cfg.m_cap).astype(jnp.int32),
         lost_mev=dep.lost_mev.at[st.sid].add(jnp.where(over, de, 0.0)), iters=dep.iters + 1,
