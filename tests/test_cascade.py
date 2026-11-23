@@ -304,3 +304,19 @@ def test_positrons_conserve_energy_with_annihilation(host):
     for ei, ev in zip(e, evs):
         assert ev["lost_mev"] == 0.0
         assert np.isclose(ev["de"].sum(), ei + 2 * em.ME, rtol=1e-8), (ei, ev["de"].sum())
+
+
+def test_pair_cross_section_is_geant4s(host):
+    """Below 30 GeV the table is Geant4's parametrisation (G4PairProductionRelModel, option 0); option B's own
+    Bethe-Heitler integral stays within a few per cent of it above 5 MeV and joins it smoothly at 30 GeV."""
+    k = np.array([2.0, 10.0, 50.0, 300.0, 3000.0])
+    g4 = em.N_ATOM_MM3 * 1e-22 * em.pair_xsec_g4_barn(k)
+    assert np.allclose(em.pair_xsec_table_per_mm(k), g4, rtol=1e-12)
+    # Geant4 numbers (barn per argon atom) at 10 MeV and 1 GeV from the same fit
+    assert np.isclose(em.pair_xsec_g4_barn(10.0), 0.7063, rtol=2e-3)
+    assert np.isclose(em.pair_xsec_g4_barn(1000.0), 2.5011, rtol=2e-3)
+    bh = em.pair_xsec_per_mm(k[1:])
+    assert np.all(np.abs(bh / g4[1:] - 1) < 0.05)
+    e = em.PAIR_G4_EMAX
+    lo, hi = em.pair_xsec_table_per_mm(np.array([e * 0.999, e * 1.001]))
+    assert abs(hi / lo - 1) < 0.01

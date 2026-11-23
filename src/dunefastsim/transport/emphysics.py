@@ -211,6 +211,45 @@ def pair_xsec_per_mm(k, n=801):
     return out
 
 
+# Total pair cross section as Geant4's option 0 computes it below 30 GeV (G4PairProductionRelModel::
+# ComputeParametrizedXSectionPerAtom, Geant4 11.4.0; the same fit as G4BetheHeitlerModel): sigma = (Z + 1)(F1 Z +
+# F2 Z^2 + F3) with F_i fifth-order polynomials in ln(E / m_e) [microbarn], E clamped at 1.5 MeV and the result
+# multiplied by ((E - 2 m_e) / (1.5 MeV - 2 m_e))^2 below it. Above 30 GeV Geant4 integrates its Coulomb-corrected
+# Bethe-Heitler cross section (with LPM above 100 GeV): option B keeps its own there, scaled to join at 30 GeV.
+PAIR_G4_A = (8.7842e+2, -1.9625e+3, 1.2949e+3, -2.0028e+2, 1.2575e+1, -2.8333e-1)
+PAIR_G4_B = (-1.0342e+1, 1.7692e+1, -8.2381, 1.3063, -9.0815e-2, 2.3586e-3)
+PAIR_G4_C = (-4.5263e+2, 1.1161e+3, -8.6749e+2, 2.1773e+2, -2.0467e+1, 6.5372e-1)
+PAIR_G4_EMAX = 30000.0  # MeV
+
+
+def pair_xsec_g4_barn(k, z=Z_AR):
+    """Geant4's parametrised pair cross section per atom [barn] at photon energy k [MeV]."""
+    k = np.asarray(k, float)
+    x = np.log(np.maximum(k, 1.5) / ME)
+
+    def poly(c):
+        return sum(ci * x ** i for i, ci in enumerate(c))
+
+    xs = (z + 1.0) * (poly(PAIR_G4_A) * z + poly(PAIR_G4_B) * z * z + poly(PAIR_G4_C)) * 1e-6
+    xs = np.where(k < 1.5, xs * ((k - 2 * ME) / (1.5 - 2 * ME)) ** 2, xs)
+    return np.where(k > 2 * ME, np.maximum(xs, 0.0), 0.0)
+
+
+def pair_xsec_table_per_mm(k):
+    """Option B's pair cross section [1/mm] (v0.0.9): Geant4's parametrisation below 30 GeV, option B's screened
+    Bethe-Heitler integral (pair_xsec_per_mm) above, scaled to join (up to v0.0.8 the integral everywhere, 2-3 %
+    above Geant4 from 10 to 100 MeV)."""
+    k = np.atleast_1d(np.asarray(k, float))
+    g4 = N_ATOM_MM3 * 1e-22 * pair_xsec_g4_barn(k)
+    hi = k >= PAIR_G4_EMAX
+    if not hi.any():
+        return g4
+    join = N_ATOM_MM3 * 1e-22 * pair_xsec_g4_barn(PAIR_G4_EMAX) / pair_xsec_per_mm(PAIR_G4_EMAX)[0]
+    out = g4.copy()
+    out[hi] = join * pair_xsec_per_mm(k[hi])
+    return out
+
+
 # ------------------------------------------------------------------------------------------------------- tables
 @dataclass
 class HostTables:
@@ -381,7 +420,7 @@ def build_tables(tcut=0.22, kcut=0.1, t_min=0.05, t_max=1e5, nt=241, k_min=0.002
     k_nodes = np.geomspace(k_min, t_max, nk)
     lnk0, dlnk = np.log(k_min), np.log(t_max / k_min) / (nk - 1)
     sig_c = N_E_MM3 * klein_nishina_xsec_per_electron(k_nodes)
-    sig_p = pair_xsec_per_mm(k_nodes)
+    sig_p = pair_xsec_table_per_mm(k_nodes)
     sig_ph = N_ATOM_MM3 * 1e-22 * photoelectric_xsec_per_atom_barn(k_nodes)  # barn = 1e-22 mm^2
     compton_q = np.zeros((nk, nc))
     pair_q = np.zeros((nk, nc))
