@@ -258,3 +258,49 @@ def test_mixed_msc_matches_emsc_and_highland_core(host, T, s):
         xs = s / host.x0_mm
         th0 = 13.6 / (beta * pc) * np.sqrt(xs) * (1 + 0.038 * np.log(xs / beta ** 2))
         assert 0.7 < np.median(th) / (1.1774 * th0) < 1.3, (positron, np.median(th), th0)
+
+
+def test_annihilation_in_flight_kinematics():
+    """Two photons carry T + 2 m_e and the positron's momentum; their energies span Geant4's range."""
+    n = 50000
+    key = jax.random.PRNGKey(2)
+    T = jnp.asarray(np.geomspace(0.2, 2000.0, n))
+    d = jnp.tile(jnp.array([0.6, 0.0, 0.8]), (n, 1))
+    u = jax.random.uniform(key, (n, 2))
+    iso = cs._isotropic(u[:, 0], u[:, 1])
+    e1, d1, e2, d2 = cs._annihilate_in_flight(T, d, iso)
+    e1, e2, d1, d2, T, d = (np.asarray(a) for a in (e1, e2, d1, d2, T, d))
+    assert np.allclose(e1 + e2, T + 2 * em.ME, rtol=1e-12)
+    p = np.sqrt(T * (T + 2 * em.ME))
+    assert np.allclose(e1[:, None] * d1 + e2[:, None] * d2, p[:, None] * d, atol=1e-8 * (T[:, None] + 1))
+    assert e1.min() > 0 and e2.min() > 0
+
+
+def test_annihilation_in_flight_table(host):
+    """Heitler cross section in the e+ row only; a 30 MeV positron slowing to 1 MeV in LAr annihilates in flight with
+    a probability of order 10 % (integral of sigma_annih over the continuous dE/dx, which ignores discrete losses and
+    so overestimates the path: a loose band)."""
+    from hepsimkernels import eannihil
+
+    assert np.all(host.sig_annih[0] == 0.0)
+    i = np.searchsorted(host.t_nodes, 10.0)
+    assert np.isclose(host.sig_annih[1, i], em.N_E_MM3 * eannihil.xsec_per_electron(host.t_nodes[i]), rtol=1e-12)
+    m = (host.t_nodes > 1.0) & (host.t_nodes < 30.0)
+    t = host.t_nodes[m]
+    trap = getattr(np, "trapezoid", None) or np.trapz
+    prob = 1 - np.exp(-trap(host.sig_annih[1, m] / host.dedx[1, m], t))
+    assert 0.02 < prob < 0.5, prob
+
+
+def test_positrons_conserve_energy_with_annihilation(host):
+    """Many positrons: total deposits = kinetic + 2 m_e each, whether they annihilate in flight or at rest."""
+    tb = cs.device_tables(host)
+    cfg = cs.Config(n_cap=8192, m_cap=1 << 18, fill=0.25)
+    nb = 64
+    e = np.geomspace(5.0, 500.0, nb)
+    f = jax.jit(lambda k, e_, v, d: cs.showers(tb, cfg, k, e_, v, d, primary=cs.E_PLUS))
+    out = f(jax.random.PRNGKey(9), e, np.zeros((nb, 3)), np.tile([0.0, 0.0, 1.0], (nb, 1)))
+    evs, _ = cs.split_events(out, nb)
+    for ei, ev in zip(e, evs):
+        assert ev["lost_mev"] == 0.0
+        assert np.isclose(ev["de"].sum(), ei + 2 * em.ME, rtol=1e-8), (ei, ev["de"].sum())

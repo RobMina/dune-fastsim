@@ -223,6 +223,7 @@ class HostTables:
     rng: np.ndarray  # (2, NT) restricted CSDA range [mm]
     sig_brem: np.ndarray  # (2, NT) photons above kcut [1/mm]
     sig_delta: np.ndarray  # (2, NT) deltas above tcut [1/mm]
+    sig_annih: np.ndarray  # (2, NT) two-photon annihilation in flight [1/mm] (row 0, e-: zero)
     brem_q: np.ndarray  # (2, NT, NC) x = ln(k/kcut)/ln(T/kcut) at CDF nodes
     delta_q: np.ndarray  # (2, NT, NC) x = ln(w/tcut)/ln(wmax/tcut) at CDF nodes
     lam1: np.ndarray  # (2, NT) first transport mean free path [mm] (hepsimkernels.emsc, Mott-corrected)
@@ -363,6 +364,11 @@ def build_tables(tcut=0.22, kcut=0.1, t_min=0.05, t_max=1e5, nt=241, k_min=0.002
         msc_k[ip], msc_s[ip], msc_ue[ip] = k_[0], s_[0], ue_
         msc_env[ip] = emsc.mott_envelope(z_, t_nodes, pos)[0]
     msc_ffa = float(emsc.FORM_FACTOR * float(emsc.elements(mat)[2][0]) ** 0.54)
+    # positron annihilation in flight (v0.0.8): Heitler per atomic electron (G4eeToTwoGammaModel, as option 0)
+    from hepsimkernels import eannihil
+
+    sig_a = np.zeros((2, nt))
+    sig_a[1] = N_E_MM3 * eannihil.xsec_per_electron(t_nodes)
     mott_coef = np.asarray(emsc.mott_coefficients()[Z_AR], float)
     w_lnq, w_lna = wentzel_table()
     # restricted CSDA range: R(T) = integral of dT / dedx from 0 (a 1/dedx extrapolation below t_min)
@@ -390,6 +396,6 @@ def build_tables(tcut=0.22, kcut=0.1, t_min=0.05, t_max=1e5, nt=241, k_min=0.002
         else:
             pair_q[i] = 0.5
     x0_mm = radiation_length_g_cm2() / RHO_LAR * 10.0
-    return HostTables(lnt0, dlnt, t_nodes, dedx, rng, sig_b, sig_d, brem_q, delta_q, lam1, msc_k, msc_s, msc_ue,
+    return HostTables(lnt0, dlnt, t_nodes, dedx, rng, sig_b, sig_d, sig_a, brem_q, delta_q, lam1, msc_k, msc_s, msc_ue,
                       msc_env, mott_coef, msc_ffa, w_lnq, w_lna, lnk0, dlnk,
                       k_nodes, sig_c, sig_p, sig_ph, compton_q, pair_q, float(tcut), float(kcut), float(x0_mm))

@@ -10,4 +10,4 @@ Subpackages:
 - ``ldm``      : thin orchestration over bdnmc-dune (not vendored)
 """
 
-__version__ = "0.0.7"
+__version__ = "0.0.8"

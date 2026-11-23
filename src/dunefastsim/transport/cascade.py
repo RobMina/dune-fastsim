@@ -26,7 +26,10 @@ Physics per step (tables from ``emphysics``; production cuts tcut for deltas and
   opposite azimuths (B1).
   Photons below ``k_track`` are absorbed where they are (their photoelectric mean free path is microns).
 
-Not yet: the mixed (class II) scattering scheme itself, annihilation in flight, Rayleigh scattering, boundaries (infinite
+Positrons (v0.0.8) also annihilate in flight on atomic electrons (Heitler cross section, two photons isotropic in the
+centre-of-mass frame, G4eeToTwoGammaModel as in Geant4's option 0), competing with bremsstrahlung and Bhabha deltas.
+
+Not yet: Rayleigh scattering, boundaries (infinite
 argon; the geometry cut is applied downstream as for option A).
 
 Many primaries per call (B2, ``showers``): the particle buffer is shared; waiting primaries enter the free lanes
@@ -59,6 +62,7 @@ class Tables(NamedTuple):
     rng: jax.Array
     sig_brem: jax.Array
     sig_delta: jax.Array
+    sig_annih: jax.Array
     brem_q: jax.Array
     delta_q: jax.Array
     lam1: jax.Array
@@ -92,7 +96,7 @@ def device_tables(h: HostTables, dtype=jnp.float64) -> Tables:
     mc = eloss_jax.consts(lar_material())
     mc = type(mc)(*(f(v) for v in mc))
     return Tables(f(h.lnt0), f(h.dlnt), f(h.t_nodes), f(h.dedx), f(h.rng), f(h.sig_brem), f(h.sig_delta),
-                  f(h.brem_q), f(h.delta_q), f(h.lam1), f(h.msc_k), f(h.msc_s), f(h.msc_ue),
+                  f(h.sig_annih), f(h.brem_q), f(h.delta_q), f(h.lam1), f(h.msc_k), f(h.msc_s), f(h.msc_ue),
                   f(h.msc_env), f(h.mott_coef), f(h.msc_ffa), f(h.wentzel_lnq), f(h.wentzel_lna), f(h.lnk0), f(h.dlnk),
                   f(h.sig_compton), f(h.sig_pair), f(h.sig_photo), f(h.compton_q), f(h.pair_q), f(h.tcut), f(h.kcut), f(h.x0_mm), mc)
 
@@ -267,6 +271,28 @@ def _msc_mixed(tb, cfg, pos, Tm, s, d, key):
     return d
 
 
+def _annihilate_in_flight(T, d, n):
+    """Two photons of a positron with kinetic energy T and direction d annihilating on a free electron at rest
+    (G4eeToTwoGammaModel, as hepsimkernels.eannihil.in_flight): n is an isotropic unit vector in the centre-of-mass
+    frame (lanes, 3). Returns (e1, dir1, e2, dir2); e1 + e2 = T + 2 m_e, momentum conserved."""
+    etot = T + 2.0 * ME
+    p = jnp.sqrt(jnp.maximum(T * (T + 2.0 * ME), 0.0))
+    half = 0.5 * jnp.sqrt(jnp.maximum(etot * etot - p * p, 1e-30))
+    beta = p / etot
+    gam = etot / (2.0 * half)
+    e1 = gam * half * (1.0 + beta * n[:, 2])
+    helper = jnp.where(jnp.abs(d[:, 2:3]) < 0.9, jnp.array([0.0, 0.0, 1.0], d.dtype), jnp.array([1.0, 0.0, 0.0], d.dtype))
+    ex = jnp.cross(d, helper)
+    ex = ex / jnp.linalg.norm(ex, axis=1, keepdims=True)
+    ey = jnp.cross(d, ex)
+    k1 = (half * n[:, 0])[:, None] * ex + (half * n[:, 1])[:, None] * ey + (gam * half * (n[:, 2] + beta))[:, None] * d
+    k2 = p[:, None] * d - k1
+    e2 = etot - e1
+    dir1 = k1 / jnp.maximum(jnp.linalg.norm(k1, axis=1, keepdims=True), 1e-30)
+    dir2 = k2 / jnp.maximum(jnp.linalg.norm(k2, axis=1, keepdims=True), 1e-30)
+    return e1, dir1, e2, dir2
+
+
 def _tsai_cos(T, r1, r2, r3):
     """Geant4's modified Tsai polar angle for a lepton of kinetic energy T (G4ModifiedTsai::SampleCosTheta): u =
     -ln(r1 r2) a, a = 1.6 with probability 0.25 else 1.6/3, capped at u_max = 2 (1 + T/m); cos = 1 - 2 u^2/u_max^2."""
@@ -330,7 +356,8 @@ def _step(tb: Tables, cfg: Config, st: State) -> State:
     # ------------------------------------------------------------------ charged particles
     sig_b = _e_tab(tb.sig_brem, pos, lnt, tb.lnt0, tb.dlnt)
     sig_d = _e_tab(tb.sig_delta, pos, lnt, tb.lnt0, tb.dlnt)
-    sig = sig_b + sig_d
+    sig_a = _e_tab(tb.sig_annih, pos, lnt, tb.lnt0, tb.dlnt)
+    sig = sig_b + sig_d + sig_a
     r = jnp.exp(_e_tab(jnp.log(jnp.maximum(tb.rng, 1e-30)), pos, lnt, tb.lnt0, tb.dlnt))
     s_int = jnp.where(sig > 0, -jnp.log(u[:, 0]) / jnp.maximum(sig, 1e-30), jnp.inf)
     s_lim = jnp.clip(cfg.f_range * r, cfg.s_min, cfg.s_max)
@@ -362,10 +389,14 @@ def _step(tb: Tables, cfg: Config, st: State) -> State:
     lnp = jnp.log(jnp.maximum(T_post, 1e-6))
     sb_p = _e_tab(tb.sig_brem, pos, lnp, tb.lnt0, tb.dlnt)
     sd_p = _e_tab(tb.sig_delta, pos, lnp, tb.lnt0, tb.dlnt)
-    p_brem = sb_p / jnp.maximum(sb_p + sd_p, 1e-30)
+    sa_p = _e_tab(tb.sig_annih, pos, lnp, tb.lnt0, tb.dlnt)
+    tot_p = jnp.maximum(sb_p + sd_p + sa_p, 1e-30)
+    p_brem = sb_p / tot_p
     is_brem = hit & (u[:, 1] < p_brem) & (T_post > tb.kcut)
+    # positron annihilation in flight (v0.0.8): the positron ends in two photons carrying T + 2 m_e
+    is_ann = hit & pos & (u[:, 1] >= p_brem) & (u[:, 1] < (sb_p + sa_p) / tot_p)
     wmax = jnp.where(pos, T_post, 0.5 * T_post)
-    is_delta = hit & ~is_brem & (wmax > tb.tcut)
+    is_delta = hit & ~is_brem & ~is_ann & (wmax > tb.tcut)
     # brem photon energy
     xb = jnp.where(pos, _lin2(tb.brem_q[1], tb.lnt0, tb.dlnt, lnp, u[:, 2]),
                    _lin2(tb.brem_q[0], tb.lnt0, tb.dlnt, lnp, u[:, 2]))
@@ -412,7 +443,7 @@ def _step(tb: Tables, cfg: Config, st: State) -> State:
     x_after = x + chord * s[:, None]
     # a lane that emitted a secondary this step keeps its particle alive one more step, so a positron never needs
     # three secondary slots (emission + two annihilation photons) at once
-    stop = charged & (ranged | ((T_after < cfg.t_track) & ~(is_brem | is_delta)))
+    stop = charged & (ranged | ((T_after < cfg.t_track) & ~(is_brem | is_delta))) & ~is_ann
     e_local = jnp.where(stop, T_after, 0.0)
     c_de = jnp.where(charged, de_c + e_local, 0.0)
     c_mid = x + chord * (0.5 * s)[:, None]
@@ -468,18 +499,20 @@ def _step(tb: Tables, cfg: Config, st: State) -> State:
         peak=jnp.maximum(dep.peak, _isum(alive)))
 
     # ------------------------------------------------------------------ next buffer: survivors, then secondaries
-    surv = (charged & ~stop) | is_comp
+    surv = (charged & ~stop & ~is_ann) | is_comp
     s_kind = jnp.where(surv, kind, DEAD)
     s_T = jnp.where(charged, T_after, k_out)
     s_x = jnp.where(charged[:, None], x_after, x_g)
     s_d = jnp.where(charged[:, None], d_after, d_g)
     s_t = jnp.where(charged, t_after_c, t_after_g)
     annih = (kind == E_PLUS) & stop
+    iso = _isotropic(u[:, 8], u[:, 9])  # at rest: one photon's direction; in flight: the centre-of-mass direction
+    ea1, da1, ea2, da2 = _annihilate_in_flight(T_post, d_msc, iso)
     # secondary 1: brem photon | delta electron | Compton electron | pair electron | annihilation photon
-    n1 = is_brem | is_delta | is_comp | is_pair | annih
-    k1 = jnp.where(is_brem | annih, GAMMA, E_MINUS)
-    T1 = jnp.where(is_brem, k_b, jnp.where(is_delta, w_d, jnp.where(is_comp, T_ce, jnp.where(is_pair, T_pm, ME))))
-    iso = _isotropic(u[:, 8], u[:, 9])
+    n1 = is_brem | is_delta | is_comp | is_pair | annih | is_ann
+    k1 = jnp.where(is_brem | annih | is_ann, GAMMA, E_MINUS)
+    T1 = jnp.where(is_brem, k_b, jnp.where(is_delta, w_d, jnp.where(is_comp, T_ce, jnp.where(is_pair, T_pm,
+                   jnp.where(is_ann, ea1, ME)))))
     d1 = jnp.where(is_delta[:, None], _rotate(d_msc, cos_d, phi_d + jnp.pi),
                    jnp.where(is_comp[:, None], d_ce, jnp.where(annih[:, None], iso, d)))
     if cfg.tsai_angles:
@@ -489,14 +522,14 @@ def _step(tb: Tables, cfg: Config, st: State) -> State:
         d_pp = _rotate(d, _tsai_cos(T_pp, u[:, 16], u[:, 17], u[:, 10]), phi_pair + jnp.pi)  # photon lanes: u10 free
     else:
         d_brem, d_pm, d_pp = d_msc, d, d
-    d1 = jnp.where(is_brem[:, None], d_brem, jnp.where(is_pair[:, None], d_pm, d1))
+    d1 = jnp.where(is_brem[:, None], d_brem, jnp.where(is_pair[:, None], d_pm, jnp.where(is_ann[:, None], da1, d1)))
     x1 = jnp.where(charged[:, None], x_after, x_g)
     t1 = jnp.where(charged, t_after_c, t_after_g)
     # secondary 2: pair positron | second annihilation photon
-    n2 = is_pair | annih
+    n2 = is_pair | annih | is_ann
     k2 = jnp.where(is_pair, E_PLUS, GAMMA)
-    T2 = jnp.where(is_pair, T_pp, ME)
-    d2 = jnp.where(annih[:, None], -iso, d_pp)
+    T2 = jnp.where(is_pair, T_pp, jnp.where(is_ann, ea2, ME))
+    d2 = jnp.where(annih[:, None], -iso, jnp.where(is_ann[:, None], da2, d_pp))
     # Compton photon below the photon cut keeps flying one more step and is absorbed there (no second deposit now)
     cnt_s, cnt_1, cnt_2 = _isum(surv), _isum(n1), _isum(n2)
     i_s = jnp.where(surv, _icum(surv) - 1, n)
