@@ -79,6 +79,7 @@ class Tables(NamedTuple):
     sig_compton: jax.Array
     sig_pair: jax.Array
     sig_photo: jax.Array
+    sig_pnuc: jax.Array
     compton_q: jax.Array
     pair_q: jax.Array
     tcut: jax.Array
@@ -98,7 +99,7 @@ def device_tables(h: HostTables, dtype=jnp.float64) -> Tables:
     return Tables(f(h.lnt0), f(h.dlnt), f(h.t_nodes), f(h.dedx), f(h.rng), f(h.sig_brem), f(h.sig_delta),
                   f(h.sig_annih), f(h.brem_q), f(h.delta_q), f(h.lam1), f(h.msc_k), f(h.msc_s), f(h.msc_ue),
                   f(h.msc_env), f(h.mott_coef), f(h.msc_ffa), f(h.wentzel_lnq), f(h.wentzel_lna), f(h.lnk0), f(h.dlnk),
-                  f(h.sig_compton), f(h.sig_pair), f(h.sig_photo), f(h.compton_q), f(h.pair_q), f(h.tcut), f(h.kcut), f(h.x0_mm), mc)
+                  f(h.sig_compton), f(h.sig_pair), f(h.sig_photo), f(h.sig_pnuc), f(h.compton_q), f(h.pair_q), f(h.tcut), f(h.kcut), f(h.x0_mm), mc)
 
 
 class Config(NamedTuple):
@@ -118,6 +119,8 @@ class Config(NamedTuple):
     msc_c1: float = 0.05  # mixed: hard collisions every msc_c1 * lambda_1 (hepsimkernels.emsc.C1) ...
     msc_mu_max: float = 2.0  # ... but at most msc_mu_max of them expected per step ...
     msc_k_hard: int = 6  # ... and at most msc_k_hard sampled (P(more) < 0.5 % at mu = 2)
+    pnuc: bool = True  # photonuclear absorption (v0.0.10): the photon ends; part of its energy is deposited ...
+    pnuc_visible: float = 0.2  # ... this fraction, where it is absorbed; the rest is invisible (nuclear_mev)
     tsai_angles: bool = True  # brem / pair angles (B1); False: collinear (B0)
     fill: float = 0.25  # B2: new primaries enter only while fewer than fill * n_cap particles are alive
 
@@ -133,6 +136,7 @@ class Deposits(NamedTuple):
     pdg: jax.Array  # (M,)
     n: jax.Array  # number written
     lost_mev: jax.Array  # energy of dropped particles and deposits (overflow); (B,) per primary in ``showers``
+    nuclear_mev: jax.Array  # energy absorbed by nuclei and not deposited (photonuclear sink); (B,) like lost_mev
     iters: jax.Array
     peak: jax.Array  # largest number of live particles in one iteration
 
@@ -454,14 +458,16 @@ def _step(tb: Tables, cfg: Config, st: State) -> State:
     sc = _lin(tb.sig_compton, tb.lnk0, tb.dlnk, lnk)
     sp = _lin(tb.sig_pair, tb.lnk0, tb.dlnk, lnk)
     sph = jnp.maximum(_lin(tb.sig_photo, tb.lnk0, tb.dlnk, lnk), 0.0)
-    sig_g = jnp.maximum(sc + sp + sph, 1e-30)
+    spn = _lin(tb.sig_pnuc, tb.lnk0, tb.dlnk, lnk) * (1.0 if cfg.pnuc else 0.0)
+    sig_g = jnp.maximum(sc + sp + sph + spn, 1e-30)
     absorb = gamma & (T < cfg.k_track)
     s_g = -jnp.log(u[:, 4]) / sig_g
     s_g = jnp.where(absorb, 0.0, s_g)
     x_g = x + d * s_g[:, None]
     is_pair = gamma & ~absorb & (u[:, 5] < sp / sig_g) & (T > 2 * ME)
     is_photo = gamma & ~absorb & ~is_pair & (u[:, 5] < (sp + sph) / sig_g)
-    is_comp = gamma & ~absorb & ~is_pair & ~is_photo
+    is_pnuc = gamma & ~absorb & ~is_pair & ~is_photo & (u[:, 5] < (sp + sph + spn) / sig_g)
+    is_comp = gamma & ~absorb & ~is_pair & ~is_photo & ~is_pnuc
     eps_c = _lin2(tb.compton_q, tb.lnk0, tb.dlnk, lnk, u[:, 6])
     k_out = eps_c * T
     T_ce = T - k_out
@@ -477,14 +483,14 @@ def _step(tb: Tables, cfg: Config, st: State) -> State:
     t_after_g = st.t + s_g / C_MM_NS
 
     # ------------------------------------------------------------------ deposits (at most one per lane)
-    g_de = jnp.where(absorb | is_photo, T, 0.0)
+    g_de = jnp.where(absorb | is_photo, T, jnp.where(is_pnuc, cfg.pnuc_visible * T, 0.0))
     de = jnp.where(charged, c_de, g_de)
     has_dep = alive & (de > 0)
-    dpos = jnp.where(charged[:, None], c_mid, jnp.where(is_photo[:, None], x_g, x))
+    dpos = jnp.where(charged[:, None], c_mid, jnp.where((is_photo | is_pnuc)[:, None], x_g, x))
     cn = jnp.linalg.norm(chord, axis=1, keepdims=True)
     ddir = jnp.where(charged[:, None] & (cn > 1e-12), chord / jnp.maximum(cn, 1e-12), d)  # the step chord
     ddx = jnp.where(charged, jnp.maximum(s, 1e-6), 1e-3)
-    dpdg = jnp.where(kind == E_PLUS, -11, jnp.where(kind == E_MINUS, 11, 22))
+    dpdg = jnp.where(kind == E_PLUS, -11, jnp.where(kind == E_MINUS, 11, jnp.where(is_pnuc, 2212, 22)))  # 2212: nuclear
     dep = st.dep
     off = dep.n + _icum(has_dep) - 1
     idx = jnp.where(has_dep, off, cfg.m_cap)  # out of range: dropped by mode="drop"
@@ -492,10 +498,11 @@ def _step(tb: Tables, cfg: Config, st: State) -> State:
     dep = dep._replace(
         pos=dep.pos.at[idx].set(dpos, mode="drop"), de=dep.de.at[idx].set(de, mode="drop"),
         dx=dep.dx.at[idx].set(ddx, mode="drop"), dirn=dep.dirn.at[idx].set(ddir, mode="drop"),
-        t=dep.t.at[idx].set(jnp.where(is_photo, t_after_g, st.t), mode="drop"), tid=dep.tid.at[idx].set(st.tid, mode="drop"),
+        t=dep.t.at[idx].set(jnp.where(is_photo | is_pnuc, t_after_g, st.t), mode="drop"), tid=dep.tid.at[idx].set(st.tid, mode="drop"),
         anc=dep.anc.at[idx].set(st.sid, mode="drop"), pdg=dep.pdg.at[idx].set(dpdg, mode="drop"),
         n=jnp.minimum(dep.n + _isum(has_dep), cfg.m_cap).astype(jnp.int32),
         lost_mev=dep.lost_mev.at[st.sid].add(jnp.where(over, de, 0.0)), iters=dep.iters + 1,
+        nuclear_mev=dep.nuclear_mev.at[st.sid].add(jnp.where(is_pnuc, (1.0 - cfg.pnuc_visible) * T, 0.0)),
         peak=jnp.maximum(dep.peak, _isum(alive)))
 
     # ------------------------------------------------------------------ next buffer: survivors, then secondaries
@@ -592,7 +599,8 @@ def showers(tb: Tables, cfg: Config, key, energy_mev, vertex_mm, direction, prim
                    jnp.broadcast_to(jnp.asarray(vertex_mm, dt), (nb, 3)), d0)
     dep = Deposits(jnp.zeros((m, 3), dt), jnp.zeros((m,), dt), jnp.zeros((m,), dt), jnp.zeros((m, 3), dt),
                    jnp.zeros((m,), dt), jnp.full((m,), -1, jnp.int32), jnp.full((m,), -1, jnp.int32),
-                   jnp.zeros((m,), jnp.int32), jnp.array(0, jnp.int32), jnp.zeros((nb,), dt), jnp.array(0, jnp.int32),
+                   jnp.zeros((m,), jnp.int32), jnp.array(0, jnp.int32), jnp.zeros((nb,), dt), jnp.zeros((nb,), dt),
+                   jnp.array(0, jnp.int32),
                    jnp.array(0, jnp.int32))
     st = State(jnp.full((n,), DEAD, jnp.int32), jnp.zeros((n,), dt), jnp.zeros((n, 3), dt),
                jnp.zeros((n, 3), dt).at[:, 2].set(1.0), jnp.zeros((n,), dt), jnp.full((n,), -1, jnp.int32),
@@ -610,7 +618,7 @@ def shower(tb: Tables, cfg: Config, key, energy_mev, vertex_mm, direction, prima
     """Deposits of one primary electron (or positron / photon) in infinite liquid argon."""
     dep = showers(tb, cfg, key, jnp.reshape(jnp.asarray(energy_mev), (1,)), jnp.reshape(jnp.asarray(vertex_mm), (1, 3)),
                   jnp.reshape(jnp.asarray(direction), (1, 3)), primary)
-    return dep._replace(lost_mev=dep.lost_mev[0])
+    return dep._replace(lost_mev=dep.lost_mev[0], nuclear_mev=dep.nuclear_mev[0])
 
 
 def make_shower_fn(tb: Tables, cfg: Config):
@@ -628,6 +636,7 @@ def split_events(dep: Deposits, nb: int):
     n = int(dep.n)
     a = {k: np.asarray(getattr(dep, k))[:n] for k in ("pos", "de", "dx", "dirn", "t", "tid", "anc", "pdg")}
     lost = np.asarray(dep.lost_mev)
+    nuc = np.asarray(dep.nuclear_mev)
     order = np.argsort(a["anc"], kind="stable")
     bounds = np.searchsorted(a["anc"][order], np.arange(nb + 1))
     out = []
@@ -636,7 +645,7 @@ def split_events(dep: Deposits, nb: int):
         tid = a["tid"][o]
         out.append({"positions_mm": a["pos"][o], "de": a["de"][o], "dx": a["dx"][o], "dir": a["dirn"][o],
                     "t": a["t"][o], "tid": tid - (tid.min() if len(tid) else 0), "pdg": a["pdg"][o],
-                    "lost_mev": float(lost[b])})
+                    "lost_mev": float(lost[b]), "nuclear_mev": float(nuc[b])})
     return out, {"iters": int(dep.iters), "peak": int(dep.peak), "deposits": n}
 
 
@@ -645,5 +654,5 @@ def to_numpy(dep: Deposits):
     n = int(dep.n)
     g = lambda a: np.asarray(a)[:n]  # noqa: E731
     return {"positions_mm": g(dep.pos), "de": g(dep.de), "dx": g(dep.dx), "dir": g(dep.dirn), "t": g(dep.t),
-            "tid": g(dep.tid), "pdg": g(dep.pdg), "lost_mev": float(dep.lost_mev), "iters": int(dep.iters),
+            "tid": g(dep.tid), "pdg": g(dep.pdg), "lost_mev": float(dep.lost_mev), "nuclear_mev": float(dep.nuclear_mev), "iters": int(dep.iters),
             "peak": int(dep.peak)}

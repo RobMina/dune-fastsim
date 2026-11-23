@@ -66,7 +66,8 @@ def test_energy_conserved(host, dtype, tol, energy):
     cfg = cs.Config(n_cap=4096, m_cap=1 << 16)
     dep = cs.to_numpy(cs.make_shower_fn(tb, cfg)(jax.random.PRNGKey(1), energy, jnp.zeros(3), jnp.array([0.0, 0, 1])))
     assert dep["lost_mev"] == 0.0 and dep["peak"] < cfg.n_cap
-    assert np.isclose(dep["de"].sum(dtype=np.float64), energy, rtol=tol), dep["de"].sum()
+    total = dep["de"].sum(dtype=np.float64) + dep["nuclear_mev"]  # invisible photonuclear energy included
+    assert np.isclose(total, energy, rtol=tol), total
     assert np.all(dep["de"] >= 0) and np.all(np.isfinite(dep["positions_mm"]))
 
 
@@ -89,7 +90,7 @@ def test_photon_and_positron_primaries(host):
     for prim, extra in ((cs.GAMMA, 0.0), (cs.E_PLUS, 2 * em.ME)):
         dep = cs.to_numpy(jax.jit(lambda k: cs.shower(tb, cfg, k, 200.0, jnp.zeros(3), jnp.array([1.0, 0, 0]),
                                                           primary=prim))(jax.random.PRNGKey(3)))
-        assert np.isclose(dep["de"].sum(), 200.0 + extra, rtol=1e-8)
+        assert np.isclose(dep["de"].sum() + dep["nuclear_mev"], 200.0 + extra, rtol=1e-8)
 
 
 @pytest.mark.parametrize("q", [1e-9, 1e-6, 1e-3, 0.05, 0.5, 0.95])
@@ -132,14 +133,14 @@ def test_fluctuations_widen_dedx(host):
     dep1 = cs.to_numpy(cs.make_shower_fn(tb, b1)(jax.random.PRNGKey(5), 1000.0, jnp.zeros(3), jnp.array([0.0, 0, 1])))
     q1 = _dedx_q(dep1)
     assert q1[2] - q1[0] > 1.3 * (q0[2] - q0[0]), (q0, q1)
-    assert np.isclose(dep1["de"].sum(), 1000.0, rtol=1e-8)
+    assert np.isclose(dep1["de"].sum() + dep1["nuclear_mev"], 1000.0, rtol=1e-8)
 
 
 def test_b0_config_still_runs(host):
     tb = cs.device_tables(host)
     cfg = cs.Config(n_cap=4096, m_cap=1 << 16, fluctuate=False, msc="highland", tsai_angles=False)
     dep = cs.to_numpy(cs.make_shower_fn(tb, cfg)(jax.random.PRNGKey(2), 300.0, jnp.zeros(3), jnp.array([0.0, 1, 0])))
-    assert np.isclose(dep["de"].sum(), 300.0, rtol=1e-8)
+    assert np.isclose(dep["de"].sum() + dep["nuclear_mev"], 300.0, rtol=1e-8)
 
 
 def test_many_showers_one_buffer(host):
@@ -155,7 +156,7 @@ def test_many_showers_one_buffer(host):
     assert info["deposits"] < cfg.m_cap and info["peak"] < cfg.n_cap
     for ei, ev in zip(e, evs):
         assert ev["lost_mev"] == 0.0
-        assert np.isclose(ev["de"].sum(), ei, rtol=1e-8, atol=1e-12), (ei, ev["de"].sum())
+        assert np.isclose(ev["de"].sum() + ev["nuclear_mev"], ei, rtol=1e-8, atol=1e-12), (ei, ev["de"].sum())
         if ei > 0:
             assert ev["tid"].min() == 0 and np.any(ev["tid"] == 0)
     # each primary's deposits belong to its own shower: the primary's first step starts at its vertex, every deposit
@@ -303,7 +304,7 @@ def test_positrons_conserve_energy_with_annihilation(host):
     evs, _ = cs.split_events(out, nb)
     for ei, ev in zip(e, evs):
         assert ev["lost_mev"] == 0.0
-        assert np.isclose(ev["de"].sum(), ei + 2 * em.ME, rtol=1e-8), (ei, ev["de"].sum())
+        assert np.isclose(ev["de"].sum() + ev["nuclear_mev"], ei + 2 * em.ME, rtol=1e-8), (ei, ev["de"].sum())
 
 
 def test_pair_cross_section_is_geant4s(host):
@@ -320,3 +321,32 @@ def test_pair_cross_section_is_geant4s(host):
     e = em.PAIR_G4_EMAX
     lo, hi = em.pair_xsec_table_per_mm(np.array([e * 0.999, e * 1.001]))
     assert abs(hi / lo - 1) < 0.01
+
+
+def test_photonuclear_argon_table(host):
+    """Giant dipole resonance of argon (G4PARTICLEXS gamma/inel18): ~37 mb near 17 MeV, ~1-2 % of a 20 MeV photon's
+    interactions; nothing below the neutron threshold region."""
+    from dunefastsim.transport import photonuclear_ar as pa
+
+    assert 30.0 < pa.xsec_mb(17.0) < 45.0 and pa.xsec_mb(5.0) < 1.0
+    k = host.k_nodes
+    i = np.searchsorted(k, 20.0)
+    frac = host.sig_pnuc[i] / (host.sig_pnuc[i] + host.sig_compton[i] + host.sig_pair[i] + host.sig_photo[i])
+    assert 0.005 < frac < 0.03, frac
+
+
+def test_photonuclear_sink_books_invisible_energy(host):
+    """20 MeV photons: some are absorbed by nuclei; deposits + nuclear_mev = energy, the nuclear deposits (pdg 2212)
+    are the visible share, and nuclear_mev the rest."""
+    tb = cs.device_tables(host)
+    cfg = cs.Config(n_cap=16384, m_cap=1 << 19, fill=0.25)  # 2000 photons at once: peak ~15800 live particles
+    nb = 2000
+    f = jax.jit(lambda k, e, v, d: cs.showers(tb, cfg, k, e, v, d, primary=cs.GAMMA))
+    out = f(jax.random.PRNGKey(4), np.full(nb, 20.0), np.zeros((nb, 3)), np.tile([0.0, 0.0, 1.0], (nb, 1)))
+    evs, _ = cs.split_events(out, nb)
+    nuc = np.array([ev["nuclear_mev"] for ev in evs])
+    vis = np.array([ev["de"][ev["pdg"] == 2212].sum() for ev in evs])
+    for ev in evs:
+        assert ev["lost_mev"] == 0.0 and np.isclose(ev["de"].sum() + ev["nuclear_mev"], 20.0, rtol=1e-8)
+    assert 0 < (nuc > 0).sum() < 0.2 * nb  # a few per cent of the photons
+    assert np.allclose(vis[nuc > 0] / (vis[nuc > 0] + nuc[nuc > 0]), cfg.pnuc_visible, atol=0.02)

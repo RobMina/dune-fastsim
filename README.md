@@ -19,7 +19,7 @@ This package **depends on** those projects and vendors none of them. What it add
 Public material only: no collaboration-internal geometry, configuration or results. Site paths come from
 `site.env` (see `site.env.example`), never from the code.
 
-## Status (v0.0.9)
+## Status (v0.0.10)
 
 | Piece | State |
 |---|---|
@@ -29,7 +29,7 @@ Public material only: no collaboration-internal geometry, configuration or resul
 | `steps.validate`, `dunefastsim steps-validate` | energy sums and containment of steps in a JAXTPC config's drift volumes |
 | `transport.parametric` (option A) | GFLASH parametric showers in liquid argon plus a leading track, a fluctuation ramp, a dE/dx spread and a photon conversion delay; differentiable, f32/f64; compared with Geant4 (below) |
 | `transport.compare` | option A or B against a Geant4 reference in the step format: deposited fraction, longitudinal and radial profiles, dE/dx, dE/dx over fixed lengths (3.72 mm pixel pitch, 10 mm), per energy bin |
-| `transport.emphysics` + `transport.cascade` (option B) | condensed-history electron/photon cascade in JAX: e± physics from [hep-simkernels](https://github.com/RobMina/hep-simkernels) up to 1 GeV (Moller/Bhabha, Seltzer-Berger, Mott-corrected transport cross section, Urban fluctuations; Geant4's option-0 G4UniversalFluctuation from v0.0.5), Tsai bremsstrahlung above, positron annihilation in flight (v0.0.8), Klein-Nishina Compton, pair production (Geant4's total cross section below 30 GeV, v0.0.9), photoelectric effect (Livermore EPICS2014, v0.0.6); mixed multiple scattering (soft Gaussian-like plus hard screened-Rutherford collisions with the Mott factor, v0.0.7) with lateral displacement, modified-Tsai emission angles; fixed-capacity particle and deposit buffers with overflow accounting; energy conserved per shower; many showers share one buffer (new primaries enter as lanes free up); extra `[transport]` |
+| `transport.emphysics` + `transport.cascade` (option B) | condensed-history electron/photon cascade in JAX: e± physics from [hep-simkernels](https://github.com/RobMina/hep-simkernels) up to 1 GeV (Moller/Bhabha, Seltzer-Berger, Mott-corrected transport cross section, Urban fluctuations; Geant4's option-0 G4UniversalFluctuation from v0.0.5), Tsai bremsstrahlung above, positron annihilation in flight (v0.0.8), Klein-Nishina Compton, pair production (Geant4's total cross section below 30 GeV, v0.0.9), photoelectric effect, photonuclear absorption (v0.0.10) (Livermore EPICS2014, v0.0.6); mixed multiple scattering (soft Gaussian-like plus hard screened-Rutherford collisions with the Mott factor, v0.0.7) with lateral displacement, modified-Tsai emission angles; fixed-capacity particle and deposit buffers with overflow accounting; energy conserved per shower; many showers share one buffer (new primaries enter as lanes free up); extra `[transport]` |
 | `geometry` JAXTPC volumes from the GDML | done; on DUNE's hall GDML v2026.03.06 every Geant4 step in the active argon lands in exactly one generated drift volume |
 | `charge` (JAXTPC) | status check only; no simulation run yet |
 | `light` (lumen 0.2 + lumen-tpc `dune_ndlar`) | status check only |
@@ -50,14 +50,14 @@ About 4 ms per shower in float32 on 4 CPU cores.
 Full samples (2000 electrons each, 34 MeV to 22 GeV; one from pi0 decays, one from eta decays), same drift volumes,
 float64, v0.0.8 defaults: longest e± step 10 mm, Geant4's option-0 fluctuation model, delta rays from 0.22 MeV (all
 three as in the Geant4 reference), mixed multiple scattering, positron annihilation in flight, Geant4's pair cross
-section (v0.0.9).
+section, photonuclear sink (v0.0.10).
 
 | | pi0 sample, Geant4 | pi0 sample, option B | eta sample, Geant4 | eta sample, option B |
 |---|---|---|---|---|
-| deposited fraction | 0.740 | 0.750 | 0.714 | 0.720 |
-| mean depth (X0) | 4.79 | 4.81 | 5.97 | 5.96 |
-| within 1 Moliere radius | 0.865 | 0.860 | 0.867 | 0.862 |
-| within 2 Moliere radii | 0.948 | 0.946 | 0.949 | 0.947 |
+| deposited fraction | 0.740 | 0.744 | 0.714 | 0.715 |
+| mean depth (X0) | 4.79 | 4.78 | 5.97 | 5.94 |
+| within 1 Moliere radius | 0.865 | 0.862 | 0.867 | 0.863 |
+| within 2 Moliere radii | 0.948 | 0.947 | 0.949 | 0.948 |
 
 dE/dx summed over fixed lengths of e± track (pi0 sample; eta sample the same within 0.01 MeV/cm), in MeV/cm:
 
@@ -104,10 +104,16 @@ from 10 to 100 MeV. Below 30 GeV option B now uses Geant4's own total cross sect
 G4PairProductionRelModel, Geant4's option 0), keeping its own energy sharing. Mean depth now agrees within the samples'
 statistics (0.02 X0 on 2000 showers; a 500-shower mean carries about 0.07 X0 of noise).
 
-**Remaining gap: nuclear reactions.** Deposited fraction is still 0.4-1.1 points high. The Geant4 reference (QGSP_BERT)
-has photonuclear and electronuclear reactions: 16 % of its showers make neutrons (0.25 % of the primary energy, carried
-away) and other nuclear products, and the knocked-out nucleons' binding energy is lost too, about 0.6-0.7 % of the
-shower energy in all, which accounts for most of the gap. Option B has no nuclear physics. Option B has the photoelectric effect (Geant4's option-0 Livermore
+**Nuclear reactions (v0.0.10).** The Geant4 reference (QGSP_BERT) has photonuclear and electronuclear reactions: 16 %
+of its showers make neutrons and other nuclear products. Rerun with them switched off (`/physics_lists/em/GammaNuclear
+false`, `ElectroNuclear false`), Geant4 deposits 0.48 points more of 1 GeV showers' energy, two thirds of option B's
+excess then. Option B now absorbs photons on argon nuclei with Geant4's evaluated cross section (G4PARTICLEXS 4.2
+`gamma/inel18` below 130 MeV, giant dipole resonance 37 mb at 17 MeV; a rough curve above 150 MeV, where 5 % of the
+reference's reactions are) and deposits 20 % of the absorbed photon's energy where it is absorbed; the other 80 % goes
+to a per-shower `nuclear_mev` total, so deposits + `nuclear_mev` + `lost_mev` still equal the primary energy. The 80 %
+is measured: Geant4's photons absorbed by nuclei carry 0.62 % of the energy, and switching the reactions off returns
+0.48 points of visible energy. Electronuclear reactions (5 % of the reference's) are not modelled. Deposited fraction
+now: mid-module 0.960 vs 0.958, at a wall 0.931 vs 0.931, full samples +0.5 / +0.07 points (pi0 / eta). Option B has the photoelectric effect (Geant4's option-0 Livermore
 model, EPICS2014 data for argon) from v0.0.6; lowering its photon cut from 0.1 MeV to the reference's 4.4 keV
 (`--kcut 0.00441638 --k-track 0.004`) changes none of these, so the default stays 0.1 MeV (30 % faster).
 
@@ -115,7 +121,8 @@ Speed, 64 showers per call in one buffer, no energy lost to buffer overflow:
 
 | | pi0 sample | eta sample (higher energies) |
 |---|---|---|
-| 4 CPU cores, float64, 10 mm steps, mixed scattering, annihilation in flight (v0.0.8) | 0.13 s per shower | 0.40 s |
+| 4 CPU cores, float64, 10 mm steps, v0.0.10 physics | 0.10 s per shower | 0.34 s |
+| 4 CPU cores, float64, 10 mm steps, mixed scattering, annihilation in flight (v0.0.8) | 0.13 s | 0.40 s |
 | 4 CPU cores, float64, 10 mm steps, mixed scattering (v0.0.7) | 0.18 s | 0.56 s |
 | 4 CPU cores, float64, 10 mm steps, Wentzel scattering (v0.0.5) | 0.11 s | 0.34 s |
 | 4 CPU cores, float64, 2 mm steps (8192 lanes, v0.0.4) | 0.37 s | 1.27 s |

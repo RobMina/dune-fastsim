@@ -280,6 +280,7 @@ class HostTables:
     sig_compton: np.ndarray  # (NK,) [1/mm]
     sig_pair: np.ndarray  # (NK,) [1/mm]
     sig_photo: np.ndarray  # (NK,) photoelectric [1/mm]
+    sig_pnuc: np.ndarray  # (NK,) photonuclear [1/mm] (photonuclear_ar, v0.0.10)
     compton_q: np.ndarray  # (NK, NC) eps = k'/k
     pair_q: np.ndarray  # (NK, NC) electron total-energy fraction
     tcut: float
@@ -422,6 +423,9 @@ def build_tables(tcut=0.22, kcut=0.1, t_min=0.05, t_max=1e5, nt=241, k_min=0.002
     sig_c = N_E_MM3 * klein_nishina_xsec_per_electron(k_nodes)
     sig_p = pair_xsec_table_per_mm(k_nodes)
     sig_ph = N_ATOM_MM3 * 1e-22 * photoelectric_xsec_per_atom_barn(k_nodes)  # barn = 1e-22 mm^2
+    from dunefastsim.transport import photonuclear_ar
+
+    sig_pn = N_ATOM_MM3 * 1e-25 * photonuclear_ar.xsec_mb(k_nodes)  # mb = 1e-25 mm^2
     compton_q = np.zeros((nk, nc))
     pair_q = np.zeros((nk, nc))
     for i, k in enumerate(k_nodes):
@@ -437,4 +441,4 @@ def build_tables(tcut=0.22, kcut=0.1, t_min=0.05, t_max=1e5, nt=241, k_min=0.002
     x0_mm = radiation_length_g_cm2() / RHO_LAR * 10.0
     return HostTables(lnt0, dlnt, t_nodes, dedx, rng, sig_b, sig_d, sig_a, brem_q, delta_q, lam1, msc_k, msc_s, msc_ue,
                       msc_env, mott_coef, msc_ffa, w_lnq, w_lna, lnk0, dlnk,
-                      k_nodes, sig_c, sig_p, sig_ph, compton_q, pair_q, float(tcut), float(kcut), float(x0_mm))
+                      k_nodes, sig_c, sig_p, sig_ph, sig_pn, compton_q, pair_q, float(tcut), float(kcut), float(x0_mm))

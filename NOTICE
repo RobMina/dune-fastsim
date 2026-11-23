@@ -10,6 +10,16 @@ This package depends on, and does not vendor or redistribute:
 - lumen and lumen-tpc (https://github.com/OmarAlterkait/lumen, .../lumen-tpc), Apache-2.0.
 - bdnmc-dune (https://github.com/RobMina/bdnmc-dune), MIT.
 - edep-sim (https://github.com/lbl-neutrino/edep-sim): its ROOT output is read; no code is copied.
+- hep-simkernels (https://github.com/RobMina/hep-simkernels), Apache-2.0: electron and photon kernels and tables.
+
+Geant4 (https://geant4.web.cern.ch), Geant4 Software License (https://geant4.web.cern.ch/license): option B
+reproduces Geant4 11.4.0 models so that it can be compared with a Geant4 reference. It carries these numbers from
+Geant4 and its data sets, with their origin in the code:
+- argon photoelectric coefficients of G4LivermorePhotoElectricModel, from G4EMLOW 8.8 livermore/phot_epics2014
+  (EPICS2014) for Z = 18 (transport/emphysics.py);
+- the pair-production cross-section fit of G4PairProductionRelModel / G4BetheHeitlerModel (transport/emphysics.py);
+- the argon photonuclear cross section of G4PARTICLEXS 4.2 gamma/inel18 (transport/photonuclear_ar.py);
+and transcribes the algorithm of G4UniversalFluctuation (transport/fluct.py).
 
 DUNE geometry files (GDML) are not part of this repository; they are fetched from DUNE's public ND_Production
 repository at a fixed commit.

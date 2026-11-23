@@ -310,7 +310,7 @@ def run(ref_path: str, config: dict, n_pairs: int = 2048, batch: int = 100, seed
 
     key = jax.random.PRNGKey(seed)
     a_rows, t_compile, t_run = [], None, 0.0
-    b_stats = {"lost_mev": 0.0, "peak_max": 0, "iters_max": 0, "deposits_max": 0}
+    b_stats = {"lost_mev": 0.0, "nuclear_mev": 0.0, "peak_max": 0, "iters_max": 0, "deposits_max": 0}
     if model == "B":
         from dunefastsim.transport import cascade as cs
         from dunefastsim.transport import emphysics as em
@@ -336,6 +336,7 @@ def run(ref_path: str, config: dict, n_pairs: int = 2048, batch: int = 100, seed
             else:
                 t_run += dt_g
             b_stats["lost_mev"] += float(sum(ev["lost_mev"] for ev in evs))
+            b_stats["nuclear_mev"] += float(sum(ev["nuclear_mev"] for ev in evs))
             b_stats["peak_max"] = max(b_stats["peak_max"], info["peak"])
             b_stats["iters_max"] = max(b_stats["iters_max"], info["iters"])
             b_stats["deposits_max"] = max(b_stats["deposits_max"], info["deposits"])
