@@ -19,7 +19,7 @@ This package **depends on** those projects and vendors none of them. What it add
 Public material only: no collaboration-internal geometry, configuration or results. Site paths come from
 `site.env` (see `site.env.example`), never from the code.
 
-## Status (v0.0.11)
+## Status (v0.0.12)
 
 | Piece | State |
 |---|---|
@@ -31,7 +31,7 @@ Public material only: no collaboration-internal geometry, configuration or resul
 | `transport.compare` | option A or B against a Geant4 reference in the step format: deposited fraction, longitudinal and radial profiles, dE/dx, dE/dx over fixed lengths (3.72 mm pixel pitch, 10 mm), per energy bin |
 | `transport.emphysics` + `transport.cascade` (option B) | condensed-history electron/photon cascade in JAX: e± physics from [hep-simkernels](https://github.com/RobMina/hep-simkernels) up to 1 GeV (Moller/Bhabha, Seltzer-Berger, Mott-corrected transport cross section, Urban fluctuations; Geant4's option-0 G4UniversalFluctuation from v0.0.5), Tsai bremsstrahlung above, positron annihilation in flight (v0.0.8), Klein-Nishina Compton, pair production (Geant4's total cross section below 30 GeV, v0.0.9), photoelectric effect, photonuclear absorption (v0.0.10) (Livermore EPICS2014, v0.0.6); mixed multiple scattering (soft Gaussian-like plus hard screened-Rutherford collisions with the Mott factor, v0.0.7) with lateral displacement, modified-Tsai emission angles; fixed-capacity particle and deposit buffers with overflow accounting; energy conserved per shower; many showers share one buffer (new primaries enter as lanes free up); extra `[transport]` |
 | `geometry` JAXTPC volumes from the GDML | done; on DUNE's hall GDML v2026.03.06 every Geant4 step in the active argon lands in exactly one generated drift volume |
-| `charge` (JAXTPC) | option B showers and Geant4 step files into JAXTPC's `DetectorSimulator` (host-side volume split, JAXTPC in float32); `charge.compare` runs both through charge and light, and optionally the pixel response (v0.0.11, forward only) |
+| `charge` (JAXTPC) | option B showers and Geant4 step files into JAXTPC's `DetectorSimulator` (host-side volume split, JAXTPC in float32); `charge.compare` runs both through charge and light, and optionally the pixel response (v0.0.11, forward only); `charge.device` splits option B's buffer into JAXTPC's volumes on the device, differentiably, so option B reaches JAXTPC's charge and light with no host step (v0.0.12) |
 | `light` (lumen 0.2 + lumen-tpc `dune_ndlar`) | status check only |
 | `ldm` (bdnmc-dune) | status check only |
 | `container/dune-fastsim-jax.def` | stub, not built |
@@ -155,9 +155,20 @@ photonuclear absorption the range of an electron of that energy. Option B now ha
 charge per MeV overall. The fixed-length dE/dx and shower numbers above are unchanged by it.
 
 Cost on 4 CPU cores: charge and light 0.6 s per event. The full pixel response of one ND-LAr event takes about 12 min
-and 44 GB on CPU (sparse pixel hits), so a pixel-level comparison over many events is for a GPU. This chain is not
-yet fully on the device: JAXTPC's volume split and padding (`build_deposit_data`) run on the host between option B and
-JAXTPC, and JAXTPC's differentiable path (`forward_segments`) is wire-only at the pinned commit.
+and 44 GB on CPU (sparse pixel hits), so a pixel-level comparison over many events is for a GPU.
+
+**On the device (v0.0.12).** `charge.device.split_volumes` is JAXTPC's `build_deposit_data` in JAX: each deposit to
+the drift volume that holds it, into that volume's frame, consecutive deposits of a track grouped, every volume padded
+to `total_pad`, giving the stacked per-volume deposits JAXTPC's jitted calculators take. `make_event_split` applies it
+to one primary of an option B buffer, so option B's output goes to JAXTPC's charge and light without leaving the
+device (`charge.compare --device-split`). It is differentiable in the deposit values: the gradient of JAXTPC's total
+charge with respect to the deposit energies matches finite differences (which volume a deposit lands in is piecewise
+constant). A volume with more than `total_pad` deposits is truncated and the dropped energy reported, where
+`build_deposit_data` raises. Checked against `build_deposit_data` field by field (tests) and on the 500 mid-module
+events: per-event energy, charge and light equal to float32 rounding (3e-7), ratios to Geant4 unchanged. It takes 1.2 s
+per event on CPU against 0.6 s for the host path's light step alone, because each event's split runs over the whole
+1M-deposit buffer. Still open for a fully differentiable chain: JAXTPC's pixel response is not differentiable at the
+pinned commit (its differentiable `forward_segments` is wire-only).
 
 ### Known issue: two ND-LAr layouts
 
@@ -213,7 +224,7 @@ src/dunefastsim/
   steps/      schema.py write.py edepsim.py validate.py
   transport/  parametric.py (option A) emphysics.py cascade.py (option B) compare.py
   geometry/   ndlar.py
-  charge/     JAXTPC adapter, compare.py (B vs Geant4 through JAXTPC)      light/  lumen adapter      ldm/  bdnmc-dune adapter
+  charge/     JAXTPC adapter, device.py (on-device volume split), compare.py (B vs Geant4 through JAXTPC)      light/  lumen adapter      ldm/  bdnmc-dune adapter
   cli.py
 tests/        synthetic pytest (JAXTPC tests skip without JAXTPC_ROOT)
 container/    Apptainer def for the JAX host (stub)

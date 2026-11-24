@@ -8,7 +8,11 @@ JAXTPC's volumes, the charge and the light, and the charge per MeV (the recombin
 deposit's dE/dx and angle to the drift field). ``--pixels K`` also runs the full pixel response on the first K events
 (sparse pixel hits; about 12 min and 44 GB per ND-LAr event on CPU) and compares hit counts and summed signal.
 
+``--device-split`` sends option B's buffer to JAXTPC through ``charge.device`` (volume split on the device, JAXTPC's
+jitted light calculator on the stacked volumes) instead of ``split_events`` + ``build_deposit_data`` on the host.
+
 CLI: python -m dunefastsim.charge.compare steps.h5 --config ndlar.yaml --out report.json [--max-events N] [--pixels K]
+     [--device-split]
 """
 
 from __future__ import annotations
@@ -41,7 +45,8 @@ def _pixel_summary(resp):
     return n, s
 
 
-def run(ref_path, config_yaml, max_events=None, total_pad=20000, pixels=0, seed=0, b_dtype="float64"):
+def run(ref_path, config_yaml, max_events=None, total_pad=20000, pixels=0, seed=0, b_dtype="float64",
+        device_split=False):
     import jax
 
     if b_dtype == "float64":
@@ -61,13 +66,29 @@ def run(ref_path, config_yaml, max_events=None, total_pad=20000, pixels=0, seed=
     rows = {"geant4": [], "option_B": []}
     pix = {"geant4": [], "option_B": []}
     t_light = {"geant4": 0.0, "option_B": 0.0}
+    if device_split:
+        from dunefastsim.charge import device as dv
+
+        split = dv.make_event_split(dv.volume_table(cfg), total_pad)
+        overflow = 0.0
     for g, idx in enumerate(C.energy_batches(ke[:n], 120000.0, 64)):
         pad = 64 - len(idx)
         out = fb(jax.random.fold_in(key, g), np.pad(ke[idx], (0, pad)), np.pad(vtx[idx], ((0, pad), (0, 0))),
                  np.pad(direc[idx], ((0, pad), (0, 0)), constant_values=1.0))
-        evs, _ = cs.split_events(out, 64)
+        evs = None if device_split else cs.split_events(out, 64)[0]
         for j, i in enumerate(idx):
-            deps = {"geant4": ch.step_file_deposits(ref_path, int(i), cfg), "option_B": ch.option_b_deposits(evs[j], cfg)}
+            deps = {"geant4": ch.step_file_deposits(ref_path, int(i), cfg)}
+            if device_split:  # option B's buffer -> JAXTPC volumes on the device, no host step
+                t0 = time.perf_counter()
+                stacked, info = split(out, j)
+                with ch.jaxtpc_precision():
+                    q, L = dv.light_stacked(sim, stacked)
+                e, qs, Ls = float(stacked.de.sum()), float(q.sum()), float(L.sum())
+                t_light["option_B"] += time.perf_counter() - t0
+                overflow += float(info.overflow_mev)
+                rows["option_B"].append((float(ke[i]), e, qs, Ls))
+            else:
+                deps["option_B"] = ch.option_b_deposits(evs[j], cfg)
             for side, dep in deps.items():
                 t0 = time.perf_counter()
                 lit = ch.light(sim, dep)
@@ -78,6 +99,8 @@ def run(ref_path, config_yaml, max_events=None, total_pad=20000, pixels=0, seed=
                     resp, _, _ = ch.pixels(sim, dep)
                     pix[side].append(_pixel_summary(resp))
     report = {"events": int(n), "config": str(config_yaml), "total_pad": total_pad, "option_B_dtype": b_dtype,
+              "option_B_split": "device" if device_split else "host",
+              "option_B_overflow_mev": overflow if device_split else None,
               "light_seconds_per_event": {k: v / max(n, 1) for k, v in t_light.items()}, "sides": {}}
     for side, r in rows.items():
         a = np.array(r)
@@ -112,8 +135,10 @@ def main(argv=None) -> int:
     p.add_argument("--total-pad", type=int, default=20000)
     p.add_argument("--pixels", type=int, default=0, help="full pixel response on the first K events")
     p.add_argument("--b-dtype", default="float64", choices=["float32", "float64"])
+    p.add_argument("--device-split", action="store_true",
+                   help="option B to JAXTPC through charge.device (no host step); --pixels then runs only Geant4")
     a = p.parse_args(argv)
-    rep = run(a.ref, a.config, a.max_events, a.total_pad, a.pixels, b_dtype=a.b_dtype)
+    rep = run(a.ref, a.config, a.max_events, a.total_pad, a.pixels, b_dtype=a.b_dtype, device_split=a.device_split)
     with open(a.out, "w") as fh:
         json.dump(rep, fh, indent=1)
     short = {s: {k: v for k, v in d.items() if k not in ("per_event",) and not isinstance(v, dict)}
