@@ -19,7 +19,7 @@ This package **depends on** those projects and vendors none of them. What it add
 Public material only: no collaboration-internal geometry, configuration or results. Site paths come from
 `site.env` (see `site.env.example`), never from the code.
 
-## Status (v0.0.12)
+## Status (v0.0.13)
 
 | Piece | State |
 |---|---|
@@ -33,7 +33,7 @@ Public material only: no collaboration-internal geometry, configuration or resul
 | `geometry` JAXTPC volumes from the GDML | done; on DUNE's hall GDML v2026.03.06 every Geant4 step in the active argon lands in exactly one generated drift volume |
 | `charge` (JAXTPC) | option B showers and Geant4 step files into JAXTPC's `DetectorSimulator` (host-side volume split, JAXTPC in float32); `charge.compare` runs both through charge and light, and optionally the pixel response (v0.0.11, forward only); `charge.device` splits option B's buffer into JAXTPC's volumes on the device, differentiably, so option B reaches JAXTPC's charge and light with no host step (v0.0.12) |
 | `light` (lumen 0.2 + lumen-tpc `dune_ndlar`) | status check only |
-| `ldm` (bdnmc-dune) | status check only |
+| `ldm` (bdnmc-dune, BdNMC's JAX port) | `ldm.chain`: BdNMC's port -> option B -> JAXTPC charge and light in one on-device chain, compared event by event with Geant4 (v0.0.13; needs JAX >= 0.11, below) |
 | `container/dune-fastsim-jax.def` | stub, not built |
 
 ### Option A against Geant4
@@ -170,6 +170,47 @@ per event on CPU against 0.6 s for the host path's light step alone, because eac
 1M-deposit buffer. Still open for a fully differentiable chain: JAXTPC's pixel response is not differentiable at the
 pinned commit (its differentiable `forward_segments` is wire-only).
 
+### The chain on the device (v0.0.13)
+
+`python -m dunefastsim.ldm.chain card.dat --trials N --config ndlar.yaml` runs B3's chain without leaving the device:
+BdNMC's JAX port ([RobMina/BdNMC](https://github.com/RobMina/BdNMC) `gpu/`, ef54a87) generates the dark-matter
+scatters and keeps the accepted rows on the device; each recoil electron becomes an option B primary in ND-LAr's
+frame (bdnmc-dune's `geometry.frame_from_card`); option B showers it; `charge.device` splits each shower into
+JAXTPC's drift volumes, and JAXTPC computes charge and light. Only per-event totals return to the host, plus the
+electrons' energies, which the host uses to pack showers into option B's buffer. A test checks the primaries against
+the HEPEVT file bdnmc-dune writes from the same rows (position, time, energy, direction, with and without a GDML
+offset).
+
+With `--ref`, a Geant4 step file made from a run of the same card and seed, Geant4's steps go through the same JAXTPC
+simulator. Eta card (m_chi 50 MeV, m_V 150 MeV), 1,048,576 trials on 4 CPU cores, the first 2000 events of each
+(`total_pad` 200,000, no overflow):
+
+| | 1457 paired events | all 2000 (different events) |
+|---|---|---|
+| energy in drift volumes, option B / Geant4 | 0.997 | 0.992 |
+| charge per MeV, option B / Geant4 | 1.003 | 1.003 |
+| scintillation photons per MeV, option B / Geant4 | 0.996 | 0.996 |
+
+The paired ratios equal v0.0.11's and v0.0.12's (1.003 and 0.997). Pairing is by content (kinetic energy within
+1e-5, vertex within 1 mm, direction within 1.4e-4 rad; the largest paired differences are 6e-7 and 0.18 mm), not by
+index: the port reproduces a run event by event on GPUs, where it is batch-invariant, but on CPU its last bits differ
+between machines, and a rejection step then draws a different event and shifts every later one. The reference was
+generated on another node with the same port commit, JAX and batch size; 9690 of the run's events were accepted against
+the reference's 9671, and 1457 of the first 2000 have a twin. Unpaired events are the same distribution, so the
+sample ratios agree, except the energy in volumes, which depends on where the vertices fall.
+
+Cost on 4 CPU cores: generation 0.3 ms per event, option B 0.39 s, split plus charge and light 1.12 s; 2000 events in
+1 h 27 min and 7.0 GB. A volume with more than `total_pad` deposits is truncated and the dropped energy reported: at
+`total_pad` 100,000, 6.7 GeV of 500 eta events was dropped.
+
+**JAX version.** The port needs JAX >= 0.11 (it locks 0.12.0.1, which needs Python >= 3.12). On 0.6.2 it does not
+finish one 65,536-trial block in 13 minutes. Option B, `charge.device` and JAXTPC (which declares `jax<0.7`) pass all
+their tests on 0.12.0.1. lumen 0.2 pins exactly 0.6.2, so `[jax]` stays at 0.6.2 until that is settled, and the chain
+runs in a separate Python 3.12 environment; its test skips below JAX 0.11. Two things changed for 0.12: `jax.experimental.disable_x64`
+is gone (`charge.jaxtpc_precision` uses `jax.enable_x64(False)`, and raises if neither exists), and those contexts are
+thread-local, while the port dispatches batches from a worker thread, so `ldm.chain.generator_precision` sets 64-bit
+mode globally for the generation step.
+
 ### Known issue: two ND-LAr layouts
 
 JAXTPC's `config/dune_ndlar_config.yaml` puts 5 modules across x and 7 along the beam (z). DUNE's ND hall geometry
@@ -186,7 +227,7 @@ python3.11 -m venv .venv && .venv/bin/pip install -e '.[test,jax]'
 .venv/bin/dunefastsim describe
 ```
 
-Extras: `[ldm]` (bdnmc-dune, also the GDML reader), `[light]` (lumen-tpc and lumen 0.2; Linux, CUDA 12 for full
+Extras: `[ldm]` (bdnmc-dune, also the GDML reader; `ldm.chain` also needs BdNMC's port, `pip install --no-deps 'git+https://github.com/RobMina/BdNMC.git@ef54a876477b022f0410dc79bc14527077de7cdf#subdirectory=gpu'`, and JAX >= 0.11), `[light]` (lumen-tpc and lumen 0.2; Linux, CUDA 12 for full
 detectors).
 
 **JAXTPC** has no licence file yet, so it is not an extra and nothing of it is redistributed here. It supports only
@@ -224,7 +265,9 @@ src/dunefastsim/
   steps/      schema.py write.py edepsim.py validate.py
   transport/  parametric.py (option A) emphysics.py cascade.py (option B) compare.py
   geometry/   ndlar.py
-  charge/     JAXTPC adapter, device.py (on-device volume split), compare.py (B vs Geant4 through JAXTPC)      light/  lumen adapter      ldm/  bdnmc-dune adapter
+  charge/     JAXTPC adapter, device.py (on-device volume split), compare.py (B vs Geant4 through JAXTPC)
+  light/      lumen adapter
+  ldm/        bdnmc-dune adapter, chain.py (BdNMC port -> option B -> JAXTPC on the device)
   cli.py
 tests/        synthetic pytest (JAXTPC tests skip without JAXTPC_ROOT)
 container/    Apptainer def for the JAX host (stub)

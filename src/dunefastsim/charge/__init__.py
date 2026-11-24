@@ -73,14 +73,20 @@ def _tools():
 
 
 def jaxtpc_precision():
-    """Context in which JAXTPC runs: 64-bit mode off. JAXTPC is float32 throughout (its kernel tables fail with
-    jax_enable_x64), while option B may run float64 and hepsimkernels switches 64-bit mode on when imported."""
-    import contextlib
-
+    """Context in which JAXTPC (and BdNMC's port in float32) runs: 64-bit mode off. JAXTPC is float32 throughout (its
+    kernel tables fail with jax_enable_x64), while option B may run float64 and hepsimkernels switches 64-bit mode on
+    when imported. ``jax.experimental.disable_x64`` up to JAX 0.6-0.10, ``jax.enable_x64(False)`` from 0.11 (which
+    removed the former); raises if neither exists rather than silently leaving 64-bit mode on."""
     import jax
+    import jax.experimental
 
     f = getattr(jax.experimental, "disable_x64", None)
-    return f() if f is not None else contextlib.nullcontext()
+    if f is not None:
+        return f()
+    g = getattr(jax, "enable_x64", None)
+    if callable(g):
+        return g(False)
+    raise RuntimeError(f"JAX {jax.__version__}: no context to turn 64-bit mode off (disable_x64 / enable_x64)")
 
 
 def make_simulator(config_yaml, total_pad: int = 50_000, **kwargs):

@@ -136,10 +136,11 @@ def split_volumes(vt: VolumeTable, total_pad: int, positions_mm, de, dx, theta, 
 
 
 def option_b_event(vt: VolumeTable, total_pad: int, dep, b, interaction_id: int = 0, group_size: int = 5,
-                   gap_threshold_mm: float = 5.0):
+                   gap_threshold_mm: float = 5.0, t0_ns=0.0):
     """Primary ``b``'s deposits of an option B ``showers`` buffer (``transport.cascade.Deposits``, on the device)
     -> (stacked VolumeDeposits, SplitInfo). Same mapping as :func:`dunefastsim.charge.option_b_deposits` (theta, phi
-    from the direction; ns -> us; track ids from 0 per primary; root track 0) without leaving the device."""
+    from the direction; ns -> us; track ids from 0 per primary; root track 0) without leaving the device. ``t0_ns``
+    is added to the deposit times (option B starts each shower at 0; a generator's vertex time goes here)."""
     import jax.numpy as jnp
 
     m = dep.de.shape[0]
@@ -150,15 +151,17 @@ def option_b_event(vt: VolumeTable, total_pad: int, dep, b, interaction_id: int 
     theta = jnp.arccos(jnp.clip(d[:, 2], -1.0, 1.0))
     phi = jnp.arctan2(d[:, 1], d[:, 0])
     z = jnp.zeros(m, jnp.int32)
-    return split_volumes(vt, total_pad, dep.pos, dep.de, dep.dx, theta, phi, tid, dep.t / 1000.0,
+    return split_volumes(vt, total_pad, dep.pos, dep.de, dep.dx, theta, phi, tid, (dep.t + t0_ns) / 1000.0,
                          z + interaction_id, z, dep.pdg, valid, group_size, gap_threshold_mm)
 
 
 def make_event_split(vt: VolumeTable, total_pad: int, group_size: int = 5, gap_threshold_mm: float = 5.0):
-    """jit-compiled ``(Deposits, b) -> (stacked VolumeDeposits, SplitInfo)`` (one compile per buffer size)."""
+    """jit-compiled ``(Deposits, b, t0_ns=0) -> (stacked VolumeDeposits, SplitInfo)`` (one compile per buffer
+    size)."""
     import jax
 
-    return jax.jit(lambda dep, b: option_b_event(vt, total_pad, dep, b, 0, group_size, gap_threshold_mm))
+    f = jax.jit(lambda dep, b, t0: option_b_event(vt, total_pad, dep, b, 0, group_size, gap_threshold_mm, t0))
+    return lambda dep, b, t0_ns=0.0: f(dep, b, t0_ns)
 
 
 def unstack(stacked, info: SplitInfo | None = None):
