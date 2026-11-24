@@ -19,7 +19,7 @@ This package **depends on** those projects and vendors none of them. What it add
 Public material only: no collaboration-internal geometry, configuration or results. Site paths come from
 `site.env` (see `site.env.example`), never from the code.
 
-## Status (v0.0.10)
+## Status (v0.0.11)
 
 | Piece | State |
 |---|---|
@@ -31,7 +31,7 @@ Public material only: no collaboration-internal geometry, configuration or resul
 | `transport.compare` | option A or B against a Geant4 reference in the step format: deposited fraction, longitudinal and radial profiles, dE/dx, dE/dx over fixed lengths (3.72 mm pixel pitch, 10 mm), per energy bin |
 | `transport.emphysics` + `transport.cascade` (option B) | condensed-history electron/photon cascade in JAX: e± physics from [hep-simkernels](https://github.com/RobMina/hep-simkernels) up to 1 GeV (Moller/Bhabha, Seltzer-Berger, Mott-corrected transport cross section, Urban fluctuations; Geant4's option-0 G4UniversalFluctuation from v0.0.5), Tsai bremsstrahlung above, positron annihilation in flight (v0.0.8), Klein-Nishina Compton, pair production (Geant4's total cross section below 30 GeV, v0.0.9), photoelectric effect, photonuclear absorption (v0.0.10) (Livermore EPICS2014, v0.0.6); mixed multiple scattering (soft Gaussian-like plus hard screened-Rutherford collisions with the Mott factor, v0.0.7) with lateral displacement, modified-Tsai emission angles; fixed-capacity particle and deposit buffers with overflow accounting; energy conserved per shower; many showers share one buffer (new primaries enter as lanes free up); extra `[transport]` |
 | `geometry` JAXTPC volumes from the GDML | done; on DUNE's hall GDML v2026.03.06 every Geant4 step in the active argon lands in exactly one generated drift volume |
-| `charge` (JAXTPC) | status check only; no simulation run yet |
+| `charge` (JAXTPC) | option B showers and Geant4 step files into JAXTPC's `DetectorSimulator` (host-side volume split, JAXTPC in float32); `charge.compare` runs both through charge and light, and optionally the pixel response (v0.0.11, forward only) |
 | `light` (lumen 0.2 + lumen-tpc `dune_ndlar`) | status check only |
 | `ldm` (bdnmc-dune) | status check only |
 | `container/dune-fastsim-jax.def` | stub, not built |
@@ -132,6 +132,33 @@ One shower at a time on CPU took 3-5 s. Float32 on the GPU gave the same physics
 fraction 0.751 vs 0.752, within 1 Moliere radius 0.872 vs 0.873, dE/dx quantiles within 0.01 MeV/cm). With 10 mm
 steps more of a shower's particles are alive at once: the buffer needs about 1.4 x as many lanes (peak 11245).
 
+### Option B through JAXTPC (v0.0.11)
+
+Same electrons, same JAXTPC ND-LAr configuration (generated from the hall GDML, EMB recombination), option B's
+deposits and Geant4's steps each through JAXTPC's charge and light (`python -m dunefastsim.charge.compare`):
+
+| | 1 GeV, mid-module (500) | pi0 sample (2000) |
+|---|---|---|
+| energy in drift volumes, option B / Geant4 | 1.002 | 1.007 |
+| charge per MeV, Geant4 (e-) | 28,061 | 28,069 |
+| charge per MeV, option B / Geant4 | 1.003 | 1.003 |
+| scintillation photons per MeV, option B / Geant4 | 0.997 | 0.997 |
+| per-event charge-per-MeV ratio, 10 / 50 / 90 % | 1.000 / 1.002 / 1.005 | 0.998 / 1.002 / 1.007 |
+
+The charge per MeV is the recombination survival, which depends on each deposit's dE/dx, so it tests the deposit
+lengths as well as the energies. Before v0.0.11 option B came out 1.4 % low: an electron that fell below the 0.1 MeV
+tracking cut booked its remaining energy over its last step alone (often 0.1 mm), which recombination saw as very
+high dE/dx (5.9 % of option B's energy above 10 MeV/cm). Each deposit's length now covers the energy it holds: a
+stopping electron's step plus its residual range, an absorbed photon's photoelectron range, and the visible part of a
+photonuclear absorption the range of an electron of that energy. Option B now has 0.08 % of its energy above
+10 MeV/cm against Geant4's 1.6 % (Geant4 follows electrons to 1 keV and resolves their dense ends), with the same
+charge per MeV overall. The fixed-length dE/dx and shower numbers above are unchanged by it.
+
+Cost on 4 CPU cores: charge and light 0.6 s per event. The full pixel response of one ND-LAr event takes about 12 min
+and 44 GB on CPU (sparse pixel hits), so a pixel-level comparison over many events is for a GPU. This chain is not
+yet fully on the device: JAXTPC's volume split and padding (`build_deposit_data`) run on the host between option B and
+JAXTPC, and JAXTPC's differentiable path (`forward_segments`) is wire-only at the pinned commit.
+
 ### Known issue: two ND-LAr layouts
 
 JAXTPC's `config/dune_ndlar_config.yaml` puts 5 modules across x and 7 along the beam (z). DUNE's ND hall geometry
@@ -186,7 +213,7 @@ src/dunefastsim/
   steps/      schema.py write.py edepsim.py validate.py
   transport/  parametric.py (option A) emphysics.py cascade.py (option B) compare.py
   geometry/   ndlar.py
-  charge/     JAXTPC adapter      light/  lumen adapter      ldm/  bdnmc-dune adapter
+  charge/     JAXTPC adapter, compare.py (B vs Geant4 through JAXTPC)      light/  lumen adapter      ldm/  bdnmc-dune adapter
   cli.py
 tests/        synthetic pytest (JAXTPC tests skip without JAXTPC_ROOT)
 container/    Apptainer def for the JAX host (stub)

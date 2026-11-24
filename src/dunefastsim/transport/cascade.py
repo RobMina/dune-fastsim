@@ -489,7 +489,18 @@ def _step(tb: Tables, cfg: Config, st: State) -> State:
     dpos = jnp.where(charged[:, None], c_mid, jnp.where((is_photo | is_pnuc)[:, None], x_g, x))
     cn = jnp.linalg.norm(chord, axis=1, keepdims=True)
     ddir = jnp.where(charged[:, None] & (cn > 1e-12), chord / jnp.maximum(cn, 1e-12), d)  # the step chord
-    ddx = jnp.where(charged, jnp.maximum(s, 1e-6), 1e-3)
+    # step length; an absorbed photon's energy is spread over its photoelectron's range (r: the e- CSDA range at T on
+    # photon lanes), so the deposit's dE/dx is an electron's, as recombination downstream needs (v0.0.11)
+    # a stopping e+- (below t_track) leaves its remaining energy over its residual range beyond the step, and the
+    # visible part of a photonuclear absorption (mostly de-excitation photons) over an electron's range: their
+    # deposits get those lengths, not the step's alone (in JAXTPC, recombination follows de / dx; v0.0.11)
+    r_after = jnp.exp(_e_tab(jnp.log(jnp.maximum(tb.rng, 1e-30)), pos, jnp.log(jnp.maximum(T_after, 1e-6)),
+                             tb.lnt0, tb.dlnt))
+    r_pn = jnp.exp(_e_tab(jnp.log(jnp.maximum(tb.rng, 1e-30)), pos, jnp.log(jnp.maximum(cfg.pnuc_visible * T, 1e-6)),
+                          tb.lnt0, tb.dlnt))
+    ddx_c = jnp.maximum(s, 1e-6) + jnp.where(stop & ~ranged & (T_after > 0), r_after, 0.0)
+    ddx = jnp.where(charged, ddx_c, jnp.where(is_pnuc, jnp.maximum(r_pn, 1e-3), jnp.where(gamma, jnp.maximum(r, 1e-3),
+                                                                                           1e-3)))
     dpdg = jnp.where(kind == E_PLUS, -11, jnp.where(kind == E_MINUS, 11, jnp.where(is_pnuc, 2212, 22)))  # 2212: nuclear
     dep = st.dep
     off = dep.n + _icum(has_dep) - 1
